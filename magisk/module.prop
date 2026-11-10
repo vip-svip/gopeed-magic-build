@@ -1,6 +1,6 @@
 id=gopeed_ksu
 name=Gopeed 魔改版（系统级）
-version=v2.0.0-beta.11
-versionCode=21100
+version=v2.0.0-beta.13
+versionCode=21400
 author=vip-svip
 description=系统级（priv-app）内置 Gopeed 客户端 + 开机自启下载服务 + WebUI 面板。支持端口启停/重启、开机自启。协议全部由软件端 Go 内核处理：HTTP/HTTPS、FTP/FTPS/FTPES、BitTorrent(.torrent/Magnet)、ed2k、HLS(.m3u8)。卸载清理全部数据，0 残留。
