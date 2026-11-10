@@ -1,0 +1,270 @@
+package download
+
+import (
+	"encoding/json"
+	"sync"
+	"time"
+
+	"github.com/GopeedLab/gopeed/internal/controller"
+	"github.com/GopeedLab/gopeed/internal/fetcher"
+	"github.com/GopeedLab/gopeed/internal/production"
+	"github.com/GopeedLab/gopeed/internal/protocol/bt"
+	"github.com/GopeedLab/gopeed/internal/protocol/ed2k"
+	"github.com/GopeedLab/gopeed/internal/protocol/ftp"
+	"github.com/GopeedLab/gopeed/internal/protocol/hls"
+	"github.com/GopeedLab/gopeed/internal/protocol/http"
+	"github.com/GopeedLab/gopeed/pkg/base"
+	enginewebview "github.com/GopeedLab/gopeed/pkg/download/engine/webview"
+	"github.com/GopeedLab/gopeed/pkg/util"
+	gonanoid "github.com/matoous/go-nanoid/v2"
+)
+
+type ResolveResult struct {
+	ID  string         `json:"id"`
+	Res *base.Resource `json:"res"`
+	// SuggestedDownloadDir is the category directory the created task would be
+	// routed to. It is only set when auto categorize is enabled, the resource is
+	// a single file, a category matches and its directory passes the white list
+	// check. It is a hint for the ui, the create call decides the final path.
+	SuggestedDownloadDir string `json:"suggestedDownloadDir,omitempty"`
+}
+
+// TaskGroup stores the directory shared by independently scheduled tasks.
+type TaskGroup struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Path      string    `json:"path"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// CreateTaskBatchResult is shared by ordinary and grouped batches.
+type CreateTaskBatchResult struct {
+	TaskIDs  []string `json:"taskIds"`
+	ParentID string   `json:"parentId,omitempty"`
+}
+
+// Task represents a download unit.
+// Options flow path:
+// REST Request (model.CreateTask/ResolveTask) -> pkg/download Downloader -> Task.Meta.Opts (base.Options) -> Fetcher.Resolve/Start (e.g. internal/protocol/http/fetcher.go)
+type Task struct {
+	ID       string               `json:"id"`
+	Protocol string               `json:"protocol"`
+	Meta     *fetcher.FetcherMeta `json:"meta"`
+	// ParentID identifies the independently stored group.
+	ParentID  string      `json:"parentId,omitempty"`
+	Status    base.Status `json:"status"`
+	Uploading bool        `json:"uploading"`
+	Progress  *Progress   `json:"progress"`
+	CreatedAt time.Time   `json:"createdAt"`
+	UpdatedAt time.Time   `json:"updatedAt"`
+	// DoneAt is the time when the task completed; nil if it has never
+	// finished. A done task never leaves the done state, so the value is
+	// written once and kept.
+	DoneAt *time.Time `json:"doneAt"`
+	// NeedsPreparation marks a task that has not run its first preparation
+	// yet. The preparation decides the download directory of the task and
+	// resolves the duplicate name in it. It runs once, after the resource is
+	// resolved, and the flag is cleared afterwards, so a queued, paused or
+	// retried task is still prepared while a prepared task is never
+	// classified or renamed again. A task stored before this flag existed
+	// does not have it and keeps its directory and name.
+	NeedsPreparation bool `json:"needsPreparation,omitempty"`
+
+	group *TaskGroup
+
+	producer         production.Source
+	producerReceived int64
+
+	fetcherManager fetcher.FetcherManager
+	fetcher        fetcher.Fetcher
+	timer          *util.Timer
+	statusLock     *sync.Mutex
+	lock           *sync.Mutex
+	statsLock      *sync.Mutex
+	statsLoaded    bool
+	stats          *fetcher.Stats
+	statsSnapshot  json.RawMessage
+	blobRefLock    *sync.Mutex
+	blobURL        string
+	runGeneration  uint64
+	speedArr       []int64
+	uploadSpeedArr []int64
+}
+
+// TaskRuntimeStatus is the lightweight, frequently refreshed view of a task.
+// It intentionally excludes request, resource and option metadata returned by
+// Task so detail pages can poll progress without repeatedly transferring the
+// full task object.
+type TaskRuntimeStatus struct {
+	Status          base.Status         `json:"status"`
+	Used            int64               `json:"used"`
+	Speed           int64               `json:"speed"`
+	Downloaded      int64               `json:"downloaded"`
+	Total           int64               `json:"total"`
+	UploadSpeed     int64               `json:"uploadSpeed"`
+	Uploaded        int64               `json:"uploaded"`
+	ExtractStatus   ExtractStatus       `json:"extractStatus"`
+	ExtractProgress int                 `json:"extractProgress"`
+	Files           []FileRuntimeStatus `json:"files"`
+}
+
+// FileRuntimeStatus maps one value returned by fetcher.Progress to its
+// original resource index. Fetchers return progress in SelectFiles order.
+type FileRuntimeStatus struct {
+	Index      int   `json:"index"`
+	Size       int64 `json:"size"`
+	Downloaded int64 `json:"downloaded"`
+}
+
+func NewTask() *Task {
+	id, err := gonanoid.New()
+	if err != nil {
+		panic(err)
+	}
+	return &Task{
+		ID:        id,
+		Status:    base.DownloadStatusReady,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+}
+
+// Name returns the display name of the task.
+func (t *Task) Name() string {
+	// Custom name first
+	if t.Meta.Opts.Name != "" {
+		return t.Meta.Opts.Name
+	}
+
+	// Task is not resolved, parse the name from the URL
+	if t.Meta.Res == nil {
+		fallbackName := "unknown"
+		if t.fetcherManager == nil {
+			return fallbackName
+		}
+		parseName := t.fetcherManager.ParseName(t.Meta.Req.URL)
+		if parseName == "" {
+			return fallbackName
+		}
+		return parseName
+	}
+
+	// Task is a folder
+	if t.Meta.Res.Name != "" {
+		return t.Meta.Res.Name
+	}
+
+	// Get the name of the first file
+	return t.Meta.Res.Files[0].Name
+}
+
+func (t *Task) MarshalJSON() ([]byte, error) {
+	type rawTaskType Task
+	jsonTask := struct {
+		*rawTaskType
+		Name  string     `json:"name"`
+		Group *TaskGroup `json:"group,omitempty"`
+	}{
+		(*rawTaskType)(t),
+		t.Name(),
+		t.group,
+	}
+	return json.Marshal(jsonTask)
+}
+
+func (t *Task) updateStatus(status base.Status) {
+	t.UpdatedAt = time.Now()
+	t.Status = status
+	// A done task never leaves the done state, so there is no branch to clear
+	// DoneAt on other transitions.
+	if status == base.DownloadStatusDone {
+		doneAt := time.Now()
+		t.DoneAt = &doneAt
+	}
+}
+
+func (t *Task) clone() *Task {
+	return util.DeepClone(t)
+}
+
+func (t *Task) updateSpeed(downloaded int64, usedTime float64) int64 {
+	return calcSpeed(&t.speedArr, downloaded, usedTime)
+}
+
+func (t *Task) updateUploadSpeed(downloaded int64, usedTime float64) int64 {
+	return calcSpeed(&t.uploadSpeedArr, downloaded, usedTime)
+}
+
+func calcSpeed(speedArr *[]int64, downloaded int64, usedTime float64) int64 {
+	if usedTime <= 0 {
+		return 0
+	}
+	if downloaded < 0 {
+		*speedArr = (*speedArr)[:0]
+		return 0
+	}
+
+	*speedArr = append(*speedArr, downloaded)
+	// Record last 5 seconds of download speed to calculate the average speed
+	if len(*speedArr) > int(5.0/usedTime) {
+		*speedArr = (*speedArr)[1:]
+	}
+
+	var total int64
+	for _, v := range *speedArr {
+		total += v
+	}
+
+	return int64(float64(total) / float64(len(*speedArr)) / usedTime)
+}
+
+type TaskFilter struct {
+	IDs         []string
+	Statuses    []base.Status
+	NotStatuses []base.Status
+}
+
+func (f *TaskFilter) IsEmpty() bool {
+	return len(f.IDs) == 0 && len(f.Statuses) == 0 && len(f.NotStatuses) == 0
+}
+
+type DownloaderConfig struct {
+	Controller    *controller.Controller
+	FetchManagers []fetcher.FetcherManager
+
+	RefreshInterval   int // RefreshInterval time duration to refresh task progress(ms)
+	Storage           Storage
+	StorageDir        string
+	TempDir           string
+	WhiteDownloadDirs []string
+	WebViewProvider   enginewebview.Provider
+
+	ProductionMode bool
+
+	*base.DownloaderStoreConfig
+}
+
+func (cfg *DownloaderConfig) Init() *DownloaderConfig {
+	if cfg.Controller == nil {
+		cfg.Controller = controller.NewController()
+	}
+	if len(cfg.FetchManagers) == 0 {
+		cfg.FetchManagers = []fetcher.FetcherManager{
+			// FTP matches by URL scheme only. It comes before the managers that
+			// match by file extension, so ftp://host/x.torrent or x.m3u8 is
+			// downloaded as a file over FTP.
+			new(ftp.FetcherManager),
+			new(hls.FetcherManager),
+			new(http.FetcherManager),
+			new(bt.FetcherManager),
+			new(ed2k.FetcherManager),
+		}
+	}
+	if cfg.RefreshInterval == 0 {
+		cfg.RefreshInterval = 350
+	}
+	if cfg.Storage == nil {
+		cfg.Storage = NewMemStorage()
+	}
+	return cfg
+}

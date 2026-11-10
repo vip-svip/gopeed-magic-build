@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Gopeed 服务</title>
+<style>
+  :root {
+    --bg: #0b0c0f;
+    --card: rgba(255,255,255,0.055);
+    --stroke: rgba(255,255,255,0.10);
+    --text: #f2f3f5;
+    --muted: rgba(242,243,245,0.56);
+    --accent: #0a84ff;
+    --ok: #30d158;
+    --err: #ff453a;
+    --warn: #ff9f0a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f5f7;
+      --card: #ffffff;
+      --stroke: rgba(0,0,0,0.08);
+      --text: #14161a;
+      --muted: rgba(20,22,26,0.55);
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0;
+    padding: 22px 16px calc(28px + env(safe-area-inset-bottom));
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header { display: flex; align-items: center; gap: 10px; margin: 4px 2px 20px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 4px rgba(48,209,88,0.16); }
+  .dot.off { background: var(--err); box-shadow: 0 0 0 4px rgba(255,69,58,0.16); }
+  h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; margin: 0; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .card { background: var(--card); border: 1px solid var(--stroke); border-radius: 18px; padding: 16px 17px; margin-bottom: 13px; }
+  .k { color: var(--muted); font-size: 12px; letter-spacing: 0.02em; margin-bottom: 6px; }
+  .addr { font: 600 21px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -0.01em; word-break: break-all; }
+  .portRow { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; }
+  .portLabel { color: var(--muted); font-size: 12.5px; }
+  .port { font: 700 30px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -0.02em; }
+  .row { display: flex; gap: 9px; margin-top: 13px; flex-wrap: wrap; }
+  button {
+    appearance: none; border: 0; border-radius: 12px;
+    padding: 11px 17px; font-size: 14px; font-weight: 600;
+    color: #fff; background: var(--accent);
+    cursor: pointer; transition: opacity .16s, transform .16s;
+    flex: 1 1 auto; min-width: 96px;
+  }
+  button:active { transform: scale(0.97); opacity: .82; }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--stroke); }
+  button.danger { background: var(--err); }
+  button.warn { background: var(--warn); }
+  button:disabled { opacity: .45; cursor: default; }
+  .status { min-height: 18px; font-size: 12.5px; color: var(--muted); margin-top: 11px; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--err); }
+  .hint { color: var(--muted); font-size: 12px; line-height: 1.6; margin-top: 10px; }
+  .sk { color: var(--muted); }
+  code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: rgba(127,127,127,0.14); padding: 2px 6px; border-radius: 6px; }
+  .toast {
+    position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom));
+    transform: translate(-50%, 18px);
+    background: rgba(28,29,33,0.94); color: #fff;
+    padding: 10px 18px; border-radius: 999px; font-size: 13px;
+    opacity: 0; pointer-events: none; transition: all .22s;
+    max-width: 86vw; text-align: center;
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+</style>
+</head>
+<body>
+
+<header>
+  <span id="dot" class="dot"></span>
+  <div>
+    <h1>Gopeed 服务</h1>
+    <div class="sub">内核运行状态与 API 端口</div>
+  </div>
+</header>
+
+<div class="card">
+  <div class="k">服务端口</div>
+  <div class="portRow">
+    <span id="port" class="port"><span class="sk">—</span></span>
+    <span class="portLabel">端口</span>
+  </div>
+  <div class="addr" id="url" style="margin-top:8px;font-size:15px;"><span class="sk">读取中…</span></div>
+  <div class="row">
+    <button id="copy" class="ghost">复制地址</button>
+  </div>
+  <div id="status" class="status"></div>
+</div>
+
+<div class="card">
+  <div class="k">端口控制</div>
+  <div class="addr" id="state" style="font-size:17px;"><span class="sk">读取中…</span></div>
+  <div class="row">
+    <button id="restart" class="warn">重启服务</button>
+    <button id="toggle">关闭端口</button>
+  </div>
+  <div class="hint">
+    关闭端口会停止内核并禁止开机自启；再次开启即恢复。<br />
+    面板本身由内核进程提供，因此关闭端口后本页将无法访问。
+  </div>
+</div>
+
+<div class="card">
+  <div class="k">模块</div>
+  <div class="addr" id="apk" style="font-size:17px;"><span class="sk">读取中…</span></div>
+  <div class="hint">命令行：<code>gopeedctl info</code> · <code>gopeedctl restart</code></div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var toastEl = $('toast');
+  var busy = false;
+
+  function toast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    clearTimeout(toastEl._t);
+    toastEl._t = setTimeout(function () { toastEl.classList.remove('show'); }, 2400);
+  }
+
+  function setStatus(msg, kind) {
+    var el = $('status');
+    el.textContent = msg;
+    el.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  var last = {};
+
+  function refresh() {
+    if (busy) return Promise.resolve();
+    busy = true;
+    return fetch('/admin/info', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        last = d || {};
+        var running = d.state === 'running';
+        var enabled = d.enabled === '1';
+        var portOpen = d.portopen === '1';
+
+        $('port').textContent = d.port || '—';
+        $('url').textContent = d.url || '—';
+
+        var stateText;
+        if (!enabled) stateText = '端口已关闭';
+        else if (running && portOpen) stateText = '运行中';
+        else if (running) stateText = '进程在，端口未就绪';
+        else stateText = '已停止';
+        $('state').textContent = stateText;
+
+        $('dot').className = 'dot ' + ((enabled && running && portOpen) ? 'on' : (enabled ? 'off' : ''));
+
+        var toggle = $('toggle');
+        toggle.textContent = enabled ? '关闭端口' : '开启端口';
+        toggle.className = enabled ? 'danger' : '';
+
+        var apkInstalled = d.apk === 'installed';
+        var formText = d.form === 'priv-app' ? '（系统级 priv-app）'
+                     : d.form === 'system-app' ? '（系统应用）'
+                     : '（模块内置）';
+        $('apk').textContent = (apkInstalled ? 'App 已安装' : 'App 未安装') + ' ' + formText;
+      })
+      .catch(function () {
+        $('state').textContent = '无法读取模块状态';
+        setStatus('模块控制脚本不可用，请确认已通过 KernelSU / Magisk 安装模块', 'err');
+      })
+      .then(function () { busy = false; });
+  }
+
+  function act(path, label) {
+    setStatus(label + '…');
+    return fetch(path, { method: 'POST', cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var msg = (d && (d.message || (d.ok ? '完成' : '失败'))) || '完成';
+        setStatus(msg, d && d.ok ? 'ok' : 'err');
+        return refresh();
+      })
+      .catch(function () { setStatus('请求失败', 'err'); });
+  }
+
+  $('copy').addEventListener('click', function () {
+    var url = ($('url').textContent || '').trim();
+    if (!url || url === '—') { setStatus('尚未获取到服务地址', 'err'); return; }
+    var ok = function () { setStatus('地址已复制', 'ok'); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(ok).catch(function () { toast(url); });
+    } else { toast(url); }
+  });
+
+  $('restart').addEventListener('click', function () {
+    var b = $('restart');
+    b.disabled = true;
+    act('/admin/restart', '正在重启服务').then(function () { b.disabled = false; });
+  });
+
+  $('toggle').addEventListener('click', function () {
+    var b = $('toggle');
+    var enabled = last.enabled === '1';
+    b.disabled = true;
+    act(enabled ? '/admin/disable' : '/admin/enable', enabled ? '正在关闭端口' : '正在开启端口')
+      .then(function () { b.disabled = false; });
+  });
+
+  refresh();
+  setInterval(function () { if (!document.hidden) refresh(); }, 10000);
+})();
+</script>
+</body>
+</html>

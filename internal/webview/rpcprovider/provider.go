@@ -1,0 +1,302 @@
+package rpcprovider
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	enginewebview "github.com/GopeedLab/gopeed/pkg/download/engine/webview"
+)
+
+type Provider struct {
+	client *Client
+}
+
+func New(cfg enginewebview.RPCConfig) enginewebview.Provider {
+	return &Provider{
+		client: NewClient(cfg),
+	}
+}
+
+func (p *Provider) IsAvailable() bool {
+	if p == nil || p.client == nil || !p.client.Enabled() {
+		return false
+	}
+	var result enginewebview.IsAvailableResult
+	if err := p.client.Call(enginewebview.MethodIsAvailable, enginewebview.IsAvailableParams{}, &result); err != nil {
+		return false
+	}
+	return result.Available
+}
+
+func (p *Provider) Open(opts enginewebview.OpenOptions) (enginewebview.Page, error) {
+	if p == nil || p.client == nil || !p.IsAvailable() {
+		return nil, enginewebview.ErrUnavailable
+	}
+	var result enginewebview.PageOpenResult
+	if err := p.client.Call(enginewebview.MethodPageOpen, enginewebview.NewPageOpenParams(opts), &result); err != nil {
+		return nil, err
+	}
+	return &page{
+		client: p.client,
+		id:     result.PageID,
+	}, nil
+}
+
+type page struct {
+	eventMu     sync.Mutex
+	events      enginewebview.EventHub
+	eventCancel context.CancelFunc
+	eventDone   chan struct{}
+	eventErr    error
+	client      *Client
+	id          string
+}
+
+func (p *page) AddInitScript(script string) error {
+	return p.client.Call(enginewebview.MethodPageAddInitScript, enginewebview.PageAddInitScriptParams{
+		PageID: p.id,
+		Script: script,
+	}, nil)
+}
+
+func (p *page) Goto(url string, opts enginewebview.GotoOptions) error {
+	return p.client.Call(enginewebview.MethodPageGoto, enginewebview.NewPageGotoParams(p.id, url, opts), nil)
+}
+
+func (p *page) Execute(expression string, args ...any) (any, error) {
+	var result any
+	if err := p.client.Call(enginewebview.MethodPageExecute, enginewebview.PageExecuteParams{
+		PageID:     p.id,
+		Expression: expression,
+		Args:       args,
+	}, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (p *page) GetCookies() ([]enginewebview.Cookie, error) {
+	var result []enginewebview.Cookie
+	if err := p.client.Call(enginewebview.MethodPageGetCookies, enginewebview.PageGetCookiesParams{
+		PageID: p.id,
+	}, &result); err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []enginewebview.Cookie{}, nil
+	}
+	return result, nil
+}
+
+func (p *page) SetCookie(cookie enginewebview.Cookie) error {
+	return p.client.Call(enginewebview.MethodPageSetCookie, enginewebview.PageSetCookieParams{
+		PageID: p.id,
+		Cookie: cookie,
+	}, nil)
+}
+
+func (p *page) DeleteCookie(cookie enginewebview.Cookie) error {
+	return p.client.Call(enginewebview.MethodPageDeleteCookie, enginewebview.PageDeleteCookieParams{
+		PageID: p.id,
+		Cookie: cookie,
+	}, nil)
+}
+
+func (p *page) ClearCookies() error {
+	return p.client.Call(enginewebview.MethodPageClearCookies, enginewebview.PageClearCookiesParams{
+		PageID: p.id,
+	}, nil)
+}
+
+func (p *page) Close() error {
+	err := p.client.Call(enginewebview.MethodPageClose, enginewebview.PageCloseParams{PageID: p.id}, nil)
+	var rpcErr *enginewebview.RPCError
+	if errors.As(err, &rpcErr) && rpcErr.Code == enginewebview.ErrorCodePageNotFound {
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	p.eventMu.Lock()
+	cancel, done := p.eventCancel, p.eventDone
+	p.eventMu.Unlock()
+	if cancel != nil {
+		// Drain the terminal notification before cancelling the transport, so
+		// already-sent navigation events keep their order before closed.
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		cancel()
+	}
+	p.events.Emit(enginewebview.Event{Name: "closed", Data: map[string]any{"reason": "api"}})
+	return nil
+}
+
+type Client struct {
+	endpoint string
+	token    string
+	http     *http.Client
+}
+
+func NewClient(cfg enginewebview.RPCConfig) *Client {
+	client := &Client{token: cfg.Token}
+	if !cfg.Enabled() {
+		return client
+	}
+	switch strings.ToLower(cfg.Network) {
+	case "unix":
+		client.endpoint = "http://unix" + enginewebview.RPCEndpointPath
+		client.http = &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", cfg.Address)
+				},
+			},
+		}
+	default:
+		client.endpoint = "http://" + cfg.Address + enginewebview.RPCEndpointPath
+		client.http = &http.Client{}
+	}
+	return client
+}
+
+func (c *Client) Enabled() bool {
+	return c != nil && c.endpoint != "" && c.http != nil
+}
+
+func (c *Client) Call(method string, params any, result any) error {
+	if !c.Enabled() {
+		return enginewebview.ErrUnavailable
+	}
+	payload, err := json.Marshal(enginewebview.RPCRequest{
+		Method: method,
+		Params: params,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("webview rpc status %d", resp.StatusCode)
+	}
+
+	var body enginewebview.RPCResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return err
+	}
+	if body.Error != nil {
+		return body.Error
+	}
+	if result == nil {
+		return nil
+	}
+	if len(body.Result) == 0 || string(body.Result) == "null" {
+		return nil
+	}
+	return json.Unmarshal(body.Result, result)
+}
+
+func (p *Provider) RemoveProfile(profileID, dataPath string) error {
+	return p.client.Call(enginewebview.MethodProfileRemove, enginewebview.ProfileRemoveParams{ProfileID: profileID}, nil)
+}
+
+// On starts one ordered notification stream per page. The ready record is sent
+// only after the host has installed its subscription.
+func (p *page) On(name string, handler func(enginewebview.Event)) (func(), error) {
+	p.eventMu.Lock()
+	defer p.eventMu.Unlock()
+	if p.eventErr != nil {
+		return nil, p.eventErr
+	}
+	unsubscribe, err := p.events.On(name, handler)
+	if err != nil {
+		return nil, err
+	}
+	if p.eventCancel != nil {
+		return unsubscribe, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	payload, err := json.Marshal(enginewebview.RPCRequest{Method: enginewebview.MethodPageEvents, Params: enginewebview.PageCloseParams{PageID: p.id}})
+	if err != nil {
+		cancel()
+		unsubscribe()
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.client.endpoint, bytes.NewReader(payload))
+	if err != nil {
+		cancel()
+		unsubscribe()
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.client.token != "" {
+		req.Header.Set("Authorization", "Bearer "+p.client.token)
+	}
+	// A broken host must not leave registration pending indefinitely.
+	timer := time.AfterFunc(30*time.Second, cancel)
+	resp, err := p.client.http.Do(req)
+	if err != nil {
+		timer.Stop()
+		cancel()
+		unsubscribe()
+		return nil, err
+	}
+	decoder := json.NewDecoder(resp.Body)
+	var ready struct {
+		Ready bool `json:"ready"`
+	}
+	err = decoder.Decode(&ready)
+	timer.Stop()
+	if err != nil || !ready.Ready || resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		cancel()
+		unsubscribe()
+		return nil, fmt.Errorf("webview event stream did not become ready: %v", err)
+	}
+	p.eventCancel = cancel
+	p.eventDone = make(chan struct{})
+	go func() {
+		defer resp.Body.Close()
+		defer cancel()
+		defer close(p.eventDone)
+		for {
+			var event enginewebview.Event
+			if err := decoder.Decode(&event); err != nil {
+				p.eventMu.Lock()
+				p.eventErr = fmt.Errorf("webview event stream disconnected: %w", err)
+				p.eventMu.Unlock()
+				return
+			}
+			p.events.Emit(event)
+			if event.Name == "closed" {
+				return
+			}
+		}
+	}()
+	return unsubscribe, nil
+}

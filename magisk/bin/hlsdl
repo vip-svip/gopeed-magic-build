@@ -1,0 +1,98 @@
+#!/system/bin/sh
+# hlsdl - m3u8 / HLS 下载入口
+#
+# 说明：Gopeed 的 Go 内核已原生支持 HLS（internal/protocol/hls 注册 .m3u8 过滤器），
+# 因此这里不需要独立的第三方二进制，本脚本把 gopeed-hls 的参数翻译成内核 CLI 支持的参数：
+#   gopeed-cli [-D 目录] [-C 并发] <url>
+#
+# 支持的翻译：
+#   -d / -dir <目录>  ->  -D <目录>
+#   -j / -C <并发>    ->  -C <并发>
+#   -H <header>       ->  暂不支持（会提示并忽略）
+#   -list             ->  暂不支持（CLI 无清晰度枚举接口）
+#   -q / -n           ->  暂不支持（清晰度由 m3u8 master 自动选最高码率）
+set -u
+
+MODDIR="${GOPEED_MODDIR:-/data/adb/modules/gopeed_ksu}"
+[ -f "$MODDIR/bin/common.sh" ] || MODDIR=$(cd "${0%/*}/.." 2>/dev/null && pwd)
+
+# 选可执行的内核 CLI
+BIN=""
+for c in "$MODDIR/bin/gopeed-cli" "$MODDIR/bin/gopeed"; do
+  [ -x "$c" ] && BIN="$c" && break
+done
+if [ -z "$BIN" ]; then
+  BIN=$(command -v gopeed-cli 2>/dev/null || command -v gopeed 2>/dev/null || true)
+fi
+if [ -z "$BIN" ]; then
+  echo "错误：找不到 gopeed 内核（$MODDIR/bin/gopeed-cli）" >&2
+  exit 1
+fi
+
+DEF_DIR="/storage/emulated/0/Download"
+[ -d "$DEF_DIR" ] || DEF_DIR="/storage/emulated/0"
+[ -d "$DEF_DIR" ] || DEF_DIR="/data/local/tmp"
+
+OUT_DIR="$DEF_DIR"
+CONN=""
+URLS=""
+
+# Go 二进制需要可解析 DNS 与证书
+if [ ! -s /system/etc/resolv.conf ] && [ -s "$MODDIR/system/etc/resolv.conf" ]; then
+  export SSL_CERT_DIR="${SSL_CERT_DIR:-/system/etc/security/cacerts}"
+fi
+export TMPDIR="${TMPDIR:-/data/adb/gopeed/tmp}"
+mkdir -p "$TMPDIR" 2>/dev/null
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d|-dir|--dir)
+      [ $# -ge 2 ] || { echo "错误：$1 缺少参数" >&2; exit 2; }
+      OUT_DIR="$2"; shift 2 ;;
+    -j|-C|--connections)
+      [ $# -ge 2 ] || { echo "错误：$1 缺少参数" >&2; exit 2; }
+      CONN="$2"; shift 2 ;;
+    -H|--header)
+      echo "提示：-H 请求头注入暂不支持（内核 CLI 无该参数），已忽略" >&2
+      shift 2 ;;
+    -list|--list)
+      echo "错误：-list 暂不支持，内核 CLI 不提供清晰度枚举；直接传入 m3u8 地址会自动选择最高码率" >&2
+      exit 3 ;;
+    -q|--quality)
+      echo "提示：-q 暂不支持（自动选择最高码率），已忽略" >&2
+      shift 2 ;;
+    -n|--name)
+      echo "提示：-n 暂不支持（输出名由内核按 URL 推导），已忽略" >&2
+      shift 2 ;;
+    -h|--help)
+      echo "用法: hlsdl <m3u8-url> [-d 目录] [-j 并发]"
+      exit 0 ;;
+    --)
+      shift
+      while [ $# -gt 0 ]; do URLS="$URLS $1"; shift; done
+      break ;;
+    -*)
+      echo "警告：未知参数 $1，已忽略" >&2
+      shift ;;
+    *)
+      URLS="$URLS $1"; shift ;;
+  esac
+done
+
+if [ -z "$URLS" ]; then
+  echo "错误：缺少 m3u8 地址" >&2
+  echo "用法: hlsdl <m3u8-url> [-d 目录] [-j 并发]" >&2
+  exit 2
+fi
+
+mkdir -p "$OUT_DIR" 2>/dev/null
+
+rc=0
+for u in $URLS; do
+  if [ -n "$CONN" ]; then
+    "$BIN" -C "$CONN" -D "$OUT_DIR" "$u" || rc=$?
+  else
+    "$BIN" -D "$OUT_DIR" "$u" || rc=$?
+  fi
+done
+exit $rc

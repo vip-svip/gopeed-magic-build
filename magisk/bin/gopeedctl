@@ -1,0 +1,160 @@
+#!/system/bin/sh
+# gopeedctl - 模块控制脚本
+# 用法: gopeedctl {start|stop|restart|status|url|info|enable|disable|log|outlog|clear-log|install-apk|apk-status|get-port|set-port <n>|open-port|close-port|dir}
+MODDIR="${GOPEED_MODDIR:-/data/adb/modules/gopeed_ksu}"
+[ -f "$MODDIR/bin/common.sh" ] || MODDIR=$(cd "${0%/*}/.." 2>/dev/null && pwd)
+. "$MODDIR/bin/common.sh"
+
+APK_PKG=com.gopeed.gopeed
+
+apk_installed() {
+  pm list packages 2>/dev/null | grep -qx "package:$APK_PKG"
+}
+
+apk_path() {
+  # 系统级优先，其次模块内置
+  for f in "$MODDIR/system/priv-app/Gopeed/Gopeed.apk" \
+           "$MODDIR/system/app/Gopeed/Gopeed.apk" \
+           "$MODDIR/app/Gopeed.apk" \
+           /data/adb/gopeed/Gopeed.apk; do
+    [ -f "$f" ] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+
+install_apk() {
+  quiet_skip=0
+  [ "$1" = "--quiet-on-skip" ] && quiet_skip=1
+  src=$(apk_path)
+  if [ -z "$src" ]; then
+    [ $quiet_skip -eq 0 ] && echo "未找到内置 APK"
+    return 1
+  fi
+  if apk_installed; then
+    [ $quiet_skip -eq 0 ] && echo "$APK_PKG 已安装，跳过"
+    log "apk 已安装，跳过"
+    return 0
+  fi
+  i=0
+  while [ $i -lt 40 ]; do
+    pm path android >/dev/null 2>&1 && break
+    sleep 3; i=$((i+1))
+  done
+  out=$(pm install -r -d "$src" 2>&1)
+  log "pm install: $out"
+  if apk_installed; then
+    echo "Gopeed App 安装成功"
+    return 0
+  fi
+  for d in /sdcard/Download /storage/emulated/0/Download; do
+    if [ -d "$d" ]; then
+      cp -f "$src" "$d/Gopeed-arm64.apk" 2>/dev/null && \
+        echo "自动安装失败，已复制到 $d/Gopeed-arm64.apk 请手动安装" && return 1
+    fi
+  done
+  echo "自动安装失败：$out"
+  return 1
+}
+
+# 一次性输出全部状态：Web 面板只需一次调用，避免多次串行 exec 造成卡顿
+print_info() {
+  echo "installed=1"
+  if is_running; then
+    echo "state=running"
+    echo "pid=$(cat "$PIDFILE" 2>/dev/null)"
+  else
+    echo "state=stopped"
+    echo "pid="
+  fi
+  if port_enabled; then echo "enabled=1"; else echo "enabled=0"; fi
+  echo "port=$BIND_PORT"
+  echo "url=http://$BIND_ADDR:$BIND_PORT"
+  if port_open; then echo "portopen=1"; else echo "portopen=0"; fi
+  if apk_installed; then echo "apk=installed"; else echo "apk=missing"; fi
+  if [ -f "$MODDIR/system/priv-app/Gopeed/Gopeed.apk" ]; then
+    echo "form=priv-app"
+  elif [ -f "$MODDIR/system/app/Gopeed/Gopeed.apk" ]; then
+    echo "form=system-app"
+  else
+    echo "form=module-apk"
+  fi
+}
+
+case "$1" in
+  start)
+    set_port_enabled 1
+    start_gopeed && start_watchdog
+    ;;
+  stop)
+    stop_watchdog; stop_gopeed
+    ;;
+  restart)
+    start_gopeed
+    stop_watchdog; stop_gopeed; sleep 1
+    set_port_enabled 1
+    start_gopeed && start_watchdog
+    ;;
+  enable)
+    set_port_enabled 1
+    start_gopeed && start_watchdog
+    echo "端口已开启 ($BIND_ADDR:$BIND_PORT)"
+    ;;
+  disable)
+    set_port_enabled 0
+    stop_watchdog; stop_gopeed
+    echo "端口已关闭（开机不再自动启动）"
+    ;;
+  watchdog) start_watchdog ;;
+  status)
+    if is_running; then echo "running pid=$(cat "$PIDFILE" 2>/dev/null)"; else echo "stopped"; fi
+    ;;
+  url) echo "http://$BIND_ADDR:$BIND_PORT" ;;
+  info) print_info ;;
+  port-open) port_open && echo open || echo closed ;;
+  # 修改端口：set-port 8080，改完自动重启让新端口生效
+  set-port)
+    newp="$2"
+    if ! set_bind_port "$newp"; then
+      echo "端口无效：$newp（需 1-65535）"
+      exit 1
+    fi
+    set_port_enabled 1
+    stop_watchdog 2>/dev/null
+    stop_gopeed 2>/dev/null
+    sleep 1
+    if start_gopeed; then
+      start_watchdog
+      echo "端口已改为 $BIND_PORT 并已重启"
+    else
+      echo "端口已写入 $BIND_PORT，但重启失败，见日志"
+      exit 1
+    fi
+    ;;
+  get-port) echo "$BIND_PORT" ;;
+  # 关闭端口：停止监听并禁止开机自启
+  close-port)
+    set_port_enabled 0
+    stop_watchdog 2>/dev/null
+    stop_gopeed 2>/dev/null
+    echo "端口已关闭（$BIND_ADDR:$BIND_PORT 已停止，开机不再自启）"
+    ;;
+  open-port)
+    set_port_enabled 1
+    if is_running; then
+      echo "端口已开启（$BIND_ADDR:$BIND_PORT）"
+    else
+      start_gopeed && start_watchdog && echo "端口已开启（$BIND_ADDR:$BIND_PORT）"
+    fi
+    ;;
+  log) tail -n "${2:-60}" "$LOG_FILE" 2>/dev/null ;;
+  outlog) tail -n "${2:-60}" "$LOG_DIR/gopeed.out" 2>/dev/null ;;
+  clear-log) : > "$LOG_FILE"; : > "$LOG_DIR/gopeed.out"; echo "日志已清空" ;;
+  install-apk) shift; install_apk "$@" ;;
+  apk-status) apk_installed && echo installed || echo missing ;;
+  dir) echo "$STATE_DIR" ;;
+  hls-version) "$MODDIR/bin/hlsdl" -version 2>/dev/null ;;
+  *)
+    echo "用法: gopeedctl {start|stop|restart|enable|disable|status|info|url|log|outlog|clear-log|install-apk|apk-status|get-port|set-port <n>|open-port|close-port|dir}"
+    exit 2
+    ;;
+esac

@@ -1,0 +1,74 @@
+//go:build web
+// +build web
+
+package main
+
+import (
+	"embed"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+
+	"github.com/GopeedLab/gopeed/cmd"
+	"github.com/GopeedLab/gopeed/pkg/rest/model"
+)
+
+//go:embed panel
+var panelFS embed.FS
+
+func main() {
+	sub, err := fs.Sub(panelFS, "panel")
+	if err != nil {
+		panic(err)
+	}
+
+	args := parse()
+	var webAuth *model.WebAuth
+	if isNotBlank(args.Username) && isNotBlank(args.Password) {
+		webAuth = &model.WebAuth{
+			Username: *args.Username,
+			Password: *args.Password,
+		}
+	}
+
+	var storageDir string
+	if args.StorageDir != nil && *args.StorageDir != "" {
+		storageDir = *args.StorageDir
+	} else {
+		exe, err := os.Executable()
+		if err != nil {
+			panic(err)
+		}
+		storageDir = filepath.Join(filepath.Dir(exe), "storage")
+	}
+
+	tempDir := ""
+	if args.TempDir != nil {
+		tempDir = *args.TempDir
+	}
+	cfg := &model.StartConfig{
+		Network:           "tcp",
+		Address:           fmt.Sprintf("%s:%d", *args.Address, *args.Port),
+		Storage:           model.StorageBolt,
+		StorageDir:        storageDir,
+		TempDir:           tempDir,
+		WhiteDownloadDirs: args.WhiteDownloadDirs,
+		ApiToken:          *args.ApiToken,
+		MCPEnable:         args.MCPEnable,
+		DownloadConfig:    args.DownloadConfig,
+		ProductionMode:    true,
+		WebEnable:         true,
+		WebFS:             sub,
+		WebAuth:           webAuth,
+		AdminHandler:      newAdminHandler(),
+	}
+	if err := cmd.Start(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func isNotBlank(str *string) bool {
+	return str != nil && *str != ""
+}

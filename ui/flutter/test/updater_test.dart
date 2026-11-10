@@ -1,0 +1,194 @@
+import 'package:flutter/material.dart' show Icons;
+import 'package:flutter/widgets.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:gopeed/features/settings/presentation/widgets/app_update_dialog.dart';
+import 'package:gopeed/features/settings/presentation/widgets/app_update_notes_viewport.dart';
+import 'package:gopeed/shared/theme/app_theme.dart';
+import 'package:gopeed/util/package_info.dart' as app_package;
+import 'package:gopeed/util/updater.dart';
+import 'package:gopeed/core/network/candidate_download.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:shadcn_flutter/shadcn_flutter.dart' as shad;
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized().platformDispatcher.localeTestValue = const Locale('en');
+
+  setUpAll(() {
+    app_package.packageInfo = PackageInfo(
+      appName: 'Gopeed',
+      packageName: 'com.gopeed.Gopeed',
+      version: '1.7.0',
+      buildNumber: '1',
+    );
+  });
+
+  test('package names use the client channel and architecture', () {
+    expect(appUpdateAssetName('2.0.0', UpdateChannel.windowsInstaller, 'ia32'), 'Gopeed-v2.0.0-windows-386.zip');
+    expect(
+      appUpdateAssetName('2.0.0-beta.3', UpdateChannel.windowsPortable, 'x64'),
+      'Gopeed-v2.0.0-beta.3-windows-amd64-portable.zip',
+    );
+    expect(appUpdateAssetName('2.0.0', UpdateChannel.macosDmg, 'arm64'), 'Gopeed-v2.0.0-macos-arm64.dmg');
+    expect(appUpdateAssetName('2.0.0', UpdateChannel.linuxDeb, 'x64'), 'Gopeed-v2.0.0-linux-amd64.deb');
+    expect(appUpdateAssetName('2.0.0', UpdateChannel.androidApk, 'arm'), 'Gopeed-v2.0.0-android-armeabi-v7a.apk');
+    expect(appUpdateAssetName('2.0.0', UpdateChannel.androidApk, 'arm64'), 'Gopeed-v2.0.0-android-arm64-v8a.apk');
+    expect(appUpdateAssetName('2.0.0', UpdateChannel.androidApk, 'x64'), 'Gopeed-v2.0.0-android-x86_64.apk');
+    expect(appUpdateAssetName('2.0.0', UpdateChannel.androidApk, 'riscv64'), 'Gopeed-v2.0.0-android.apk');
+    for (final channel in [
+      null,
+      UpdateChannel.linuxFlathub,
+      UpdateChannel.linuxSnap,
+      UpdateChannel.linuxAppImage,
+      UpdateChannel.linuxRpm,
+      UpdateChannel.iosIpa,
+      UpdateChannel.docker,
+    ]) {
+      expect(appUpdateAssetName('2.0.0', channel, 'arm64'), isEmpty);
+    }
+  });
+
+  test('selects the matching bilingual release notes', () {
+    const notes = '# Release notes\n\n- English change\n\n# 更新日志\n\n- 中文更新';
+    expect(localizedReleaseNotes(notes, 'en'), '# Release notes\n\n- English change');
+    expect(localizedReleaseNotes(notes, 'zh-CN'), '# 更新日志\n\n- 中文更新');
+  });
+
+  testWidgets('update dialog shows beta versions without tag prefixes', (tester) async {
+    tester.view.physicalSize = const Size(390, 760);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    app_package.packageInfo = PackageInfo(
+      appName: 'Gopeed',
+      packageName: 'com.gopeed.Gopeed',
+      version: '2.0.0.1',
+      buildNumber: '1',
+    );
+    addTearDown(() {
+      app_package.packageInfo = PackageInfo(
+        appName: 'Gopeed',
+        packageName: 'com.gopeed.Gopeed',
+        version: '1.7.0',
+        buildNumber: '1',
+      );
+    });
+
+    const version = VersionInfo(
+      version: '2.0.0-beta.2',
+      changeLog: '# Release notes\n\n- Faster downloads\n\n# 更新日志\n\n- 下载更快',
+      releaseUrl: 'https://example.com/release',
+    );
+    await tester.pumpWidget(
+      shad.ShadcnApp(
+        theme: AppTheme.light(),
+        materialTheme: AppTheme.materialLight(),
+        home: Builder(
+          builder: (context) => shad.SecondaryButton(
+            onPressed: () => showAppUpdateDialog(context, versionInfo: version, onUpdate: (_, _) async {}),
+            child: const Text('Open update'),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Open update'));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('app-update-dialog')), findsOneWidget);
+    expect(find.text('A new version is available'), findsOneWidget);
+    expect(find.text('2.0.0-beta.1  →  2.0.0-beta.2'), findsOneWidget);
+    expect(find.textContaining('v2.0.0'), findsNothing);
+    expect(find.text('Faster downloads'), findsOneWidget);
+    expect(find.text('下载更快'), findsNothing);
+    expect(find.text('Later'), findsOneWidget);
+    expect(find.text('Update'), findsOneWidget);
+    expect(find.text("What's New"), findsNothing);
+    final versionText = tester.widget<Text>(find.text('2.0.0-beta.1  →  2.0.0-beta.2'));
+    expect(versionText.style?.decoration, TextDecoration.none);
+    expect(versionText.style?.inherit, isFalse);
+    expect(find.byIcon(Icons.system_update_alt_outlined), findsNothing);
+    final dialog = tester.getRect(find.byKey(const ValueKey('app-update-dialog')));
+    expect(dialog.width, lessThan(320));
+    expect(tester.getCenter(find.byKey(const ValueKey('app-update-heading'))).dx, closeTo(dialog.center.dx, 0.01));
+    expect(tester.getCenter(find.byKey(const ValueKey('app-update-actions'))).dx, closeTo(dialog.center.dx, 0.01));
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final width in [390.0, 1024.0]) {
+    testWidgets('checksum failures prevent success and show a localized error at $width', (tester) async {
+      tester.view.physicalSize = Size(width, 760);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+      var attempts = 0;
+      await tester.pumpWidget(
+        shad.ShadcnApp(
+          theme: AppTheme.light(),
+          materialTheme: AppTheme.materialLight(),
+          home: Builder(
+            builder: (context) => shad.SecondaryButton(
+              onPressed: () => showAppUpdateDialog(
+                context,
+                versionInfo: const VersionInfo(
+                  version: '2.0.0',
+                  changeLog: '',
+                  releaseUrl: 'https://github.com/GopeedLab/gopeed/releases/tag/v2.0.0',
+                ),
+                onUpdate: (_, progress) async {
+                  attempts++;
+                  progress(100, 100);
+                  throw const DownloadChecksumException();
+                },
+              ),
+              child: const Text('Open update'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Open update'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Update'));
+      await tester.pumpAndSettle();
+      expect(attempts, 1);
+      expect(find.text('Update verification failed. Installation stopped.'), findsOneWidget);
+      expect(find.text('Update failed. Please try again later'), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('release notes keep the last line above the fade when scrolled to the end', (tester) async {
+    await tester.pumpWidget(
+      shad.ShadcnApp(
+        theme: AppTheme.dark(),
+        materialTheme: AppTheme.materialDark(),
+        home: Center(
+          child: SizedBox(
+            width: 280,
+            child: AppUpdateNotesViewport(
+              child: Column(children: [for (var i = 0; i < 30; i++) Text('Release note $i')]),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final scrollbar = tester.widget<shad.Scrollbar>(find.byType(shad.Scrollbar));
+    expect(scrollbar.thumbVisibility, isTrue);
+    final controller = scrollbar.controller!;
+    expect(controller.position.maxScrollExtent, greaterThan(0));
+    controller.jumpTo(controller.position.maxScrollExtent);
+    await tester.pumpAndSettle();
+    final viewport = tester.getRect(find.byType(AppUpdateNotesViewport));
+    final lastLine = tester.getRect(find.text('Release note 29'));
+    expect(lastLine.bottom, lessThanOrEqualTo(viewport.bottom - 24));
+    expect(lastLine.top, greaterThan(viewport.top));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+  });
+}

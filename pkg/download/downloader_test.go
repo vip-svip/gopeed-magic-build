@@ -1,0 +1,5143 @@
+package download
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	gohttp "net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	internalblob "github.com/GopeedLab/gopeed/internal/blob"
+	"github.com/GopeedLab/gopeed/internal/controller"
+	"github.com/GopeedLab/gopeed/internal/fetcher"
+	"github.com/GopeedLab/gopeed/internal/test"
+	"github.com/GopeedLab/gopeed/pkg/base"
+	"github.com/GopeedLab/gopeed/pkg/protocol/http"
+	"github.com/GopeedLab/gopeed/pkg/util"
+)
+
+type generationTestManager struct {
+	starts         atomic.Int32
+	pauses         atomic.Int32
+	holdOpen       bool
+	resolveStarted chan struct{}
+	resolveRelease <-chan struct{}
+	resolveErr     error
+	resolveOnce    sync.Once
+	pauseStarted   chan struct{}
+	pauseRelease   <-chan struct{}
+	pauseOnce      sync.Once
+}
+
+func TestExtensionTaskMethodsMatchEventCapabilities(t *testing.T) {
+	taskType := reflect.TypeOf((*Task)(nil))
+	for _, typ := range []reflect.Type{taskType, reflect.TypeOf((*ExtensionTask)(nil)), reflect.TypeOf((*OnErrorExtensionTask)(nil))} {
+		for _, name := range []string{"SetExtra", "PatchExtra", "PatchHeaders", "SetMethod", "SetBody", "SetHeaders", "PutHeader", "DelHeader", "SetTrackers"} {
+			if _, ok := typ.MethodByName(name); ok {
+				t.Fatalf("%v unexpectedly exposes %s", typ, name)
+			}
+		}
+	}
+	requestType := reflect.TypeOf((*ExtensionTaskRequest)(nil))
+	for _, name := range []string{"SetUrl", "SetLabels", "PutLabel", "DelLabel", "SetMethod", "SetBody", "SetHeaders", "PutHeader", "DelHeader", "SetTrackers"} {
+		if _, ok := requestType.MethodByName(name); !ok {
+			t.Fatalf("request wrapper does not expose %s", name)
+		}
+	}
+	for _, typ := range []reflect.Type{reflect.TypeOf(ExtensionTask{}), reflect.TypeOf(OnErrorExtensionTask{})} {
+		if _, ok := typ.FieldByName("Req"); ok {
+			t.Fatalf("%v exposes the removed task.req entry", typ)
+		}
+		field, ok := typ.FieldByName("Meta")
+		if !ok || field.Type != reflect.TypeOf((*ExtensionTaskMeta)(nil)) {
+			t.Fatalf("%v has no metadata wrapper", typ)
+		}
+	}
+	field, ok := reflect.TypeOf(ExtensionTaskMeta{}).FieldByName("Req")
+	if !ok || field.Type != requestType {
+		t.Fatal("meta.req has no request wrapper")
+	}
+	if _, ok := taskType.MethodByName("Continue"); ok {
+		t.Fatal("regular task unexpectedly exposes Continue")
+	}
+	if _, ok := taskType.MethodByName("SetUrl"); ok {
+		t.Fatal("regular task unexpectedly exposes SetUrl")
+	}
+
+	extensionTaskType := reflect.TypeOf((*ExtensionTask)(nil))
+	for _, typ := range []reflect.Type{extensionTaskType, reflect.TypeOf((*OnErrorExtensionTask)(nil))} {
+		if _, ok := typ.MethodByName("SetUrl"); !ok {
+			t.Fatalf("%v does not expose the deprecated SetUrl alias", typ)
+		}
+	}
+	if _, ok := extensionTaskType.MethodByName("Continue"); ok {
+		t.Fatal("non-error extension task unexpectedly exposes Continue")
+	}
+
+	errorTaskType := reflect.TypeOf((*OnErrorExtensionTask)(nil))
+	if _, ok := errorTaskType.MethodByName("Continue"); !ok {
+		t.Fatal("onError task does not expose Continue")
+	}
+
+	startTaskField, _ := reflect.TypeOf(OnStartContext{}).FieldByName("Task")
+	if startTaskField.Type != extensionTaskType {
+		t.Fatalf("onStart does not inject the request mutation wrapper: %v", startTaskField.Type)
+	}
+	doneTaskField, _ := reflect.TypeOf(OnDoneContext{}).FieldByName("Task")
+	if doneTaskField.Type != taskType {
+		t.Fatalf("onDone unexpectedly injects a mutation wrapper: %v", doneTaskField.Type)
+	}
+	errorTaskField, _ := reflect.TypeOf(OnErrorContext{}).FieldByName("Task")
+	if errorTaskField.Type != errorTaskType {
+		t.Fatalf("onError does not inject the recovery wrapper: %v", errorTaskField.Type)
+	}
+}
+
+func (m *generationTestManager) Name() string { return "generation" }
+func (m *generationTestManager) Filters() []*fetcher.SchemeFilter {
+	return []*fetcher.SchemeFilter{{Type: fetcher.FilterTypeUrl, Pattern: "generation"}}
+}
+func (m *generationTestManager) Build() fetcher.Fetcher {
+	return &generationTestFetcher{manager: m, meta: &fetcher.FetcherMeta{}}
+}
+func (m *generationTestManager) ParseName(string) string            { return "generation.bin" }
+func (m *generationTestManager) AutoRename() bool                   { return false }
+func (m *generationTestManager) DefaultConfig() any                 { return map[string]any{} }
+func (m *generationTestManager) Store(fetcher.Fetcher) (any, error) { return nil, nil }
+func (m *generationTestManager) Restore() (any, func(*fetcher.FetcherMeta, any) fetcher.Fetcher) {
+	return nil, func(meta *fetcher.FetcherMeta, _ any) fetcher.Fetcher {
+		return &generationTestFetcher{manager: m, meta: meta}
+	}
+}
+func (m *generationTestManager) Close() error { return nil }
+
+type generationTestFetcher struct {
+	manager *generationTestManager
+	meta    *fetcher.FetcherMeta
+	stats   *fetcher.Stats
+	done    chan error
+}
+
+func (f *generationTestFetcher) Setup(*controller.Controller) {
+	if f.done == nil {
+		f.done = make(chan error, 2)
+	}
+}
+func (f *generationTestFetcher) Resolve(req *base.Request) error {
+	if f.manager.resolveStarted != nil {
+		f.manager.resolveOnce.Do(func() { close(f.manager.resolveStarted) })
+	}
+	if f.manager.resolveRelease != nil {
+		<-f.manager.resolveRelease
+	}
+	if f.manager.resolveErr != nil {
+		return f.manager.resolveErr
+	}
+	f.meta.Req = req
+
+	f.meta.Res = &base.Resource{Files: []*base.FileInfo{{Name: "generation.bin", Size: 1}}}
+	return nil
+}
+func (f *generationTestFetcher) Start() error {
+	f.manager.starts.Add(1)
+	if !f.manager.holdOpen {
+		f.done <- nil
+	}
+	return nil
+}
+func (f *generationTestFetcher) Patch(req *base.Request, opts *base.Options) error {
+	if req != nil && req.URL != "" {
+		f.meta.Req.URL = req.URL
+	}
+	if opts != nil {
+		f.meta.Opts = opts
+	}
+	return nil
+}
+func (f *generationTestFetcher) Pause() error {
+	f.manager.pauses.Add(1)
+	if f.manager.pauseStarted != nil {
+		f.manager.pauseOnce.Do(func() { close(f.manager.pauseStarted) })
+	}
+	if f.manager.pauseRelease != nil {
+		<-f.manager.pauseRelease
+	}
+	return nil
+}
+func (f *generationTestFetcher) Close() error               { return nil }
+func (f *generationTestFetcher) Stats() *fetcher.Stats      { return f.stats }
+func (f *generationTestFetcher) Meta() *fetcher.FetcherMeta { return f.meta }
+func (f *generationTestFetcher) Progress() fetcher.Progress { return fetcher.Progress{1} }
+func (f *generationTestFetcher) Wait() error                { return <-f.done }
+
+type recoveryTestData struct {
+	SeedBytes int64
+}
+
+type recoveryTestManager struct {
+	*generationTestManager
+}
+
+func newRecoveryTestManager() *recoveryTestManager {
+	return &recoveryTestManager{generationTestManager: &generationTestManager{}}
+}
+
+func (m *recoveryTestManager) Build() fetcher.Fetcher {
+	return &recoveryTestFetcher{
+		generationTestFetcher: &generationTestFetcher{manager: m.generationTestManager, meta: &fetcher.FetcherMeta{}},
+		data:                  &recoveryTestData{},
+	}
+}
+
+func (m *recoveryTestManager) Store(f fetcher.Fetcher) (any, error) {
+	return f.(*recoveryTestFetcher).data, nil
+}
+
+func (m *recoveryTestManager) Restore() (any, func(*fetcher.FetcherMeta, any) fetcher.Fetcher) {
+	return &recoveryTestData{}, func(meta *fetcher.FetcherMeta, value any) fetcher.Fetcher {
+		return &recoveryTestFetcher{
+			generationTestFetcher: &generationTestFetcher{manager: m.generationTestManager, meta: meta},
+			data:                  value.(*recoveryTestData),
+		}
+	}
+}
+
+type recoveryTestFetcher struct {
+	*generationTestFetcher
+	data *recoveryTestData
+}
+
+func newTestDownloadOpt(t *testing.T) *base.Options {
+	t.Helper()
+	return newTestDownloadOptAt(t.TempDir())
+}
+
+func newTestDownloadOptAt(path string) *base.Options {
+	return &base.Options{
+		Path: path,
+		Name: test.DownloadName,
+		Extra: http.OptsExtra{
+			Connections: testDownloadConnections,
+		},
+	}
+}
+
+const testDownloadConnections = 4
+
+func TestDownloader_Resolve(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	req := &base.Request{
+		URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+	}
+	rr, err := downloader.Resolve(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &base.Resource{
+		Size:  test.BuildSize,
+		Range: true,
+		Files: []*base.FileInfo{
+			{
+				Name: test.BuildName,
+				Path: "",
+				Size: test.BuildSize,
+			},
+		},
+	}
+	if !test.AssertResourceEqual(want, rr.Res) {
+		t.Errorf("Resolve() got = %v, want %v", rr.Res, want)
+	}
+}
+
+func TestDownloader_BlobRegistryDoesNotUseStorageDirForSpooling(t *testing.T) {
+	storageDir := t.TempDir()
+	downloader := NewDownloader(&DownloaderConfig{
+		Storage:    NewMemStorage(),
+		StorageDir: storageDir,
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	if downloader.blob == nil {
+		t.Fatal("expected blob registry to be initialized")
+	}
+	if downloader.blob.Dir() != "" {
+		t.Fatalf("expected blob registry not to use a spool dir, got %s", downloader.blob.Dir())
+	}
+	if _, err := os.Stat(filepath.Join(storageDir, "blob")); !os.IsNotExist(err) {
+		t.Fatalf("expected blob spool dir not to be created, got err=%v", err)
+	}
+}
+
+func TestDownloader_BlobTaskKeepsConfiguredHTTPConnections(t *testing.T) {
+	downloader := NewDownloader(&DownloaderConfig{
+		Storage:    NewMemStorage(),
+		StorageDir: t.TempDir(),
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	url, err := downloader.blob.CreateBlob([]byte("hello"), "text/plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := downloader.CreateDirect(&base.Request{URL: url}, &base.Options{
+		Path:  t.TempDir(),
+		Name:  "blob-unmarked.txt",
+		Extra: &http.OptsExtra{Connections: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := downloader.GetTask(id)
+	if task == nil {
+		t.Fatal("task not found")
+	}
+	if task.Protocol != "http" {
+		t.Fatalf("expected blob task protocol http, got %s", task.Protocol)
+	}
+	extra, ok := task.Meta.Opts.Extra.(*http.OptsExtra)
+	if !ok {
+		t.Fatalf("expected http extra, got %T", task.Meta.Opts.Extra)
+	}
+	if extra.Connections != 8 {
+		t.Fatalf("expected blob task connections to stay 8, got %d", extra.Connections)
+	}
+	waitForTaskStatus(t, downloader, id, base.DownloadStatusDone, 5*time.Second)
+}
+
+func TestDownloader_ExternalBlobLikePathUsesNormalHTTP(t *testing.T) {
+	payload := []byte("external blob-like path")
+	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		if r.URL.Path != "/__blob/file.bin" {
+			gohttp.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	dir := t.TempDir()
+	id, err := downloader.CreateDirect(&base.Request{URL: server.URL + "/__blob/file.bin"}, &base.Options{
+		Path: dir,
+		Name: "external.bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForTaskStatus(t, downloader, id, base.DownloadStatusDone, 5*time.Second)
+	got, err := os.ReadFile(filepath.Join(dir, "external.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("unexpected external payload %q", string(got))
+	}
+}
+
+func TestDownloader_InternalBlobBypassesGlobalProxy(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	downloader.cfg.DownloaderStoreConfig.Proxy = &base.DownloaderProxyConfig{
+		Enable: true,
+		Scheme: "http",
+		Host:   "127.0.0.1:1",
+	}
+
+	payload := []byte("direct blob")
+	blobURL, err := downloader.blob.CreateBlob(payload, "application/octet-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	id, err := downloader.CreateDirect(&base.Request{URL: blobURL}, &base.Options{
+		Path: dir,
+		Name: "direct.bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForTaskStatus(t, downloader, id, base.DownloadStatusDone, 5*time.Second)
+	got, err := os.ReadFile(filepath.Join(dir, "direct.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("unexpected blob payload %q", string(got))
+	}
+}
+
+func TestDownloader_RegistryMissUsesOrdinaryHTTPError(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	liveURL, err := downloader.blob.CreateBlob([]byte("unused"), "text/plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingURL := liveURL[:len(liveURL)-1] + "x"
+	if downloader.blob.IsURL(missingURL) {
+		t.Fatal("test URL unexpectedly matched the Registry")
+	}
+
+	errorCh := make(chan error, 1)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyError {
+			select {
+			case errorCh <- event.Err:
+			default:
+			}
+		}
+	})
+	_, err = downloader.CreateDirect(&base.Request{URL: missingURL}, &base.Options{
+		Path: t.TempDir(),
+		Name: "missing.bin",
+	})
+	if err != nil {
+		t.Fatalf("Registry miss was rejected before ordinary HTTP handling: %v", err)
+	}
+	select {
+	case got := <-errorCh:
+		if errors.Is(got, internalblob.ErrSourceNotFound) {
+			t.Fatalf("Registry miss surfaced Blob error instead of HTTP failure: %v", got)
+		}
+		if got == nil || !strings.Contains(got.Error(), "404") {
+			t.Fatalf("expected ordinary HTTP 404 failure, got %v", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Registry miss did not reach the ordinary HTTP error path")
+	}
+}
+
+func TestDownloader_TasksShareBlobLease(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	downloader.cfg.MaxRunning = 1
+
+	payload := bytes.Repeat([]byte("shared-blob-"), 8192)
+	allowLaterOpens := make(chan struct{})
+	var opens atomic.Int32
+	blobURL, err := downloader.blob.CreateOpener(func(ctx context.Context, req internalblob.OpenRequest) (io.ReadCloser, error) {
+		if opens.Add(1) > 1 {
+			select {
+			case <-allowLaterOpens:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		start := req.Offset
+		end := int64(len(payload))
+		if req.End >= start && req.End+1 < end {
+			end = req.End + 1
+		}
+		return io.NopCloser(bytes.NewReader(payload[start:end])), nil
+	}, &internalblob.CreateOptions{Size: int64(len(payload))})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	idA, err := downloader.CreateDirect(&base.Request{URL: blobURL}, &base.Options{Path: dirA, Name: "a.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, err := downloader.CreateDirect(&base.Request{URL: blobURL}, &base.Options{Path: dirB, Name: "b.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitForTaskStatus(t, downloader, idA, base.DownloadStatusDone, 5*time.Second)
+	if err := downloader.Delete(&TaskFilter{IDs: []string{idA}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !downloader.blob.IsURL(blobURL) {
+		t.Fatal("deleting the first task revoked a Blob still leased by the second task")
+	}
+	close(allowLaterOpens)
+	waitForTaskStatus(t, downloader, idB, base.DownloadStatusDone, 5*time.Second)
+	if downloader.blob.IsURL(blobURL) {
+		t.Fatal("final task completion did not release the shared Blob")
+	}
+	for _, file := range []string{filepath.Join(dirA, "a.bin"), filepath.Join(dirB, "b.bin")} {
+		got, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("unexpected shared Blob content in %s", file)
+		}
+	}
+}
+
+func TestDownloader_EmptyBlob(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	blobURL, err := downloader.blob.CreateBlob(nil, "application/octet-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	id, err := downloader.CreateDirect(&base.Request{URL: blobURL}, &base.Options{Path: dir, Name: "empty.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForTaskStatus(t, downloader, id, base.DownloadStatusDone, 5*time.Second)
+	info, err := os.Stat(filepath.Join(dir, "empty.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("unexpected empty Blob size: %d", info.Size())
+	}
+}
+
+func TestDownloader_PatchTransfersBlobLease(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	// Keep the task waiting so Patch exercises only metadata and lease transfer.
+	downloader.cfg.MaxRunning = 0
+
+	urlA, err := downloader.blob.CreateBlob([]byte("a"), "text/plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	urlB, err := downloader.blob.CreateBlob([]byte("b"), "text/plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := downloader.CreateDirect(&base.Request{URL: urlA}, &base.Options{Path: t.TempDir(), Name: "patched.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := downloader.Patch(id, &base.Request{URL: urlB}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if downloader.blob.IsURL(urlA) {
+		t.Fatal("Patch retained the old Blob lease")
+	}
+	if !downloader.blob.IsURL(urlB) {
+		t.Fatal("Patch did not acquire the new Blob lease")
+	}
+	if err := downloader.Delete(&TaskFilter{IDs: []string{id}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if downloader.blob.IsURL(urlB) {
+		t.Fatal("deleting patched task did not release the new Blob lease")
+	}
+}
+
+func TestDownloader_StaleStartGenerationCannotRestartTask(t *testing.T) {
+	manager := &generationTestManager{}
+	downloader := NewDownloader(&DownloaderConfig{FetchManagers: []fetcher.FetcherManager{manager}})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	downloader.cfg.MaxRunning = 0
+
+	id, err := downloader.CreateDirect(&base.Request{URL: "generation://test"}, &base.Options{
+		Path: t.TempDir(),
+		Name: "generation.bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := downloader.GetTask(id)
+	if task == nil || task.Status != base.DownloadStatusWait {
+		t.Fatalf("expected queued task, got %#v", task)
+	}
+
+	// Hold task.lock so the first Start, its Pause handler, and the second Start
+	// are all queued. Only the newest start generation may reach Fetcher.Start.
+	task.lock.Lock()
+	downloader.cfg.MaxRunning = 1
+	if err := downloader.Continue(&TaskFilter{IDs: []string{id}}); err != nil {
+		t.Fatal(err)
+	}
+	pauseDone := make(chan error, 1)
+	go func() {
+		pauseDone <- downloader.Pause(&TaskFilter{IDs: []string{id}})
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for downloader.taskStatus(task) != base.DownloadStatusPause && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if downloader.taskStatus(task) != base.DownloadStatusPause {
+		t.Fatal("Pause did not update task status")
+	}
+	if err := downloader.Continue(&TaskFilter{IDs: []string{id}}); err != nil {
+		t.Fatal(err)
+	}
+	task.lock.Unlock()
+	select {
+	case err := <-pauseDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Pause did not finish")
+	}
+
+	waitForTaskStatus(t, downloader, id, base.DownloadStatusDone, 3*time.Second)
+	if got := manager.starts.Load(); got != 1 {
+		t.Fatalf("stale start generation reached Fetcher.Start: got %d starts, want 1", got)
+	}
+}
+
+func TestDownloader_PauseWinsAgainstStaleResolveError(t *testing.T) {
+	releaseResolve := make(chan struct{})
+	manager := &generationTestManager{
+		resolveStarted: make(chan struct{}),
+		resolveRelease: releaseResolve,
+		resolveErr:     errors.New("stale resolve failed"),
+	}
+	downloader := NewDownloader(&DownloaderConfig{FetchManagers: []fetcher.FetcherManager{manager}})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	errorEvent := make(chan error, 1)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyError {
+			errorEvent <- event.Err
+		}
+	})
+	id, err := downloader.CreateDirect(&base.Request{URL: "generation://stale-resolve"}, &base.Options{
+		Path: t.TempDir(),
+		Name: "stale.bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-manager.resolveStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Resolve did not start")
+	}
+
+	pauseDone := make(chan error, 1)
+	go func() {
+		pauseDone <- downloader.Pause(&TaskFilter{IDs: []string{id}})
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for downloader.taskStatus(downloader.GetTask(id)) != base.DownloadStatusPause && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := downloader.taskStatus(downloader.GetTask(id)); got != base.DownloadStatusPause {
+		t.Fatalf("Pause did not win the status transition: %s", got)
+	}
+	close(releaseResolve)
+	select {
+	case err := <-pauseDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Pause did not finish after stale Resolve returned")
+	}
+	if got := downloader.taskStatus(downloader.GetTask(id)); got != base.DownloadStatusPause {
+		t.Fatalf("stale Resolve error overwrote Pause: %s", got)
+	}
+	select {
+	case err := <-errorEvent:
+		t.Fatalf("stale Resolve emitted onError after Pause: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestDownloader_SchedulingPauseCompletesBeforeReplacementStart(t *testing.T) {
+	releasePause := make(chan struct{})
+	manager := &generationTestManager{
+		holdOpen:     true,
+		pauseStarted: make(chan struct{}),
+		pauseRelease: releasePause,
+	}
+	downloader := NewDownloader(&DownloaderConfig{FetchManagers: []fetcher.FetcherManager{manager}})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	downloader.cfg.MaxRunning = 1
+
+	_, err := downloader.CreateDirect(&base.Request{URL: "generation://a"}, &base.Options{
+		Path: t.TempDir(), Name: "a.bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for manager.starts.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if manager.starts.Load() != 1 {
+		t.Fatal("first task did not physically start")
+	}
+	idB, err := downloader.CreateDirect(&base.Request{URL: "generation://b"}, &base.Options{
+		Path: t.TempDir(), Name: "b.bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if downloader.taskStatus(downloader.GetTask(idB)) != base.DownloadStatusWait {
+		t.Fatal("second task was not queued")
+	}
+
+	continueDone := make(chan error, 1)
+	go func() {
+		continueDone <- downloader.Continue(&TaskFilter{IDs: []string{idB}})
+	}()
+	select {
+	case <-manager.pauseStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("running task was not physically paused")
+	}
+	if got := manager.starts.Load(); got != 1 {
+		t.Fatalf("replacement started before Pause completed: %d starts", got)
+	}
+	close(releasePause)
+	select {
+	case err := <-continueDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Continue did not return after Pause completed")
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for manager.starts.Load() != 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := manager.starts.Load(); got != 2 {
+		t.Fatalf("replacement task did not start: %d starts", got)
+	}
+	if got := manager.pauses.Load(); got != 1 {
+		t.Fatalf("unexpected physical Pause count: %d", got)
+	}
+}
+
+func TestDownloader_Create(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	req := &base.Request{
+		URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+	}
+	opts := newTestDownloadOpt(t)
+	rr, err := downloader.Resolve(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			wg.Done()
+		}
+	})
+	_, err = downloader.CreateWithOptions(rr.ID, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	want := test.FileMd5(test.BuildFile)
+	got := test.FileMd5(filepath.Join(opts.Path, opts.Name))
+	if want != got {
+		t.Errorf("Downloader_Create() got = %v, want %v", got, want)
+	}
+}
+
+func TestDownloader_CreateDirectUsesPathAsDefault(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		downloader.Delete(nil, true)
+		downloader.Clear()
+	}()
+
+	initialDir := t.TempDir()
+	cfg, err := downloader.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DownloadDir = initialDir
+	if err := downloader.PutConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	createAndWait := func(opts *base.Options) {
+		t.Helper()
+		done := make(chan struct{}, 1)
+		downloader.Listener(func(event *Event) {
+			if event.Key == EventKeyDone {
+				done <- struct{}{}
+			}
+		})
+		req := &base.Request{URL: "http://" + listener.Addr().String() + "/" + test.BuildName}
+		if _, err := downloader.CreateDirect(req, opts); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("task did not finish")
+		}
+	}
+
+	selectedRoot := t.TempDir()
+	defaultPathOpts := newTestDownloadOptAt(selectedRoot)
+	defaultPathOpts.AsDefaultPath = true
+	// The global default download directory is only saved for a directory the
+	// user named explicitly, so the task skips the auto categorize decision.
+	defaultPathOpts.SkipAutoCategorize = true
+	createAndWait(defaultPathOpts)
+	cfg, err = downloader.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DownloadDir != selectedRoot {
+		t.Fatalf("DownloadDir = %q, want selected root %q", cfg.DownloadDir, selectedRoot)
+	}
+
+	cfg.DownloadDir = initialDir
+	if err := downloader.PutConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	createAndWait(newTestDownloadOpt(t))
+	cfg, err = downloader.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DownloadDir != initialDir {
+		t.Fatalf("DownloadDir = %q, want unchanged %q", cfg.DownloadDir, initialDir)
+	}
+}
+
+func TestDownloader_CreateNotInWhite(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(&DownloaderConfig{
+		WhiteDownloadDirs: []string{"./downloads"},
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	req := &base.Request{
+		URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+	}
+	rr, err := downloader.Resolve(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The directory is decided when the task starts, so a directory outside
+	// the allowlist fails the task instead of the create call.
+	taskId, err := downloader.CreateWithOptions(rr.ID, newTestDownloadOpt(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := downloader.GetTask(taskId)
+	if task == nil {
+		t.Fatal("task not found")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if task.Status == base.DownloadStatusError {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if task.Status != base.DownloadStatusError {
+		t.Fatalf("task status = %q, want the task to be rejected by the allowlist", task.Status)
+	}
+}
+
+func TestDownloader_CreateDirectBatch(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		downloader.Delete(nil, true)
+		downloader.Clear()
+	}()
+
+	reqs := make([]*base.CreateTaskBatchItem, 0)
+	fileNames := make([]string, 0)
+	for i := 0; i < 5; i++ {
+		req := &base.Request{
+			URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+		}
+		reqs = append(reqs, &base.CreateTaskBatchItem{
+			Req: req,
+		})
+		if i == 0 {
+			fileNames = append(fileNames, test.DownloadName)
+		} else {
+			arr := strings.Split(test.DownloadName, ".")
+			fileNames = append(fileNames, arr[0]+" ("+strconv.Itoa(i)+")."+arr[1])
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(len(reqs))
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			wg.Done()
+		}
+	})
+
+	opts := newTestDownloadOpt(t)
+	_, err := downloader.CreateDirectBatch(&base.CreateTaskBatch{
+		Reqs: reqs,
+		Opts: opts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wg.Wait()
+
+	tasks := downloader.GetTasks()
+	if len(tasks) != len(reqs) {
+		t.Errorf("CreateDirectBatch() task got = %v, want %v", len(tasks), len(reqs))
+	}
+
+	// Collect all task names
+	taskNames := make(map[string]bool)
+	for _, task := range tasks {
+		taskNames[task.Meta.Opts.Name] = true
+	}
+
+	// Check that we have the expected number of unique task names
+	if len(taskNames) != len(reqs) {
+		t.Errorf("CreateDirectBatch() unique task names got = %v, want %v, names: %v", len(taskNames), len(reqs), taskNames)
+	}
+
+	// Check that all task files exist
+	for name := range taskNames {
+		if _, err := os.Stat(filepath.Join(opts.Path, name)); os.IsNotExist(err) {
+			t.Errorf("CreateDirectBatch() file not exist: %v", name)
+		}
+	}
+
+}
+
+func TestDownloader_CreateWithProxy(t *testing.T) {
+	// No proxy
+	doTestDownloaderCreateWithProxy(t, false, nil, func(proxyCfg *base.DownloaderProxyConfig) *base.DownloaderProxyConfig {
+		return nil
+	}, nil)
+	// Disable proxy
+	doTestDownloaderCreateWithProxy(t, false, nil, func(proxyCfg *base.DownloaderProxyConfig) *base.DownloaderProxyConfig {
+		proxyCfg.Enable = false
+		return proxyCfg
+	}, nil)
+	// Enable system proxy but not set proxy environment variable
+	doTestDownloaderCreateWithProxy(t, false, nil, func(proxyCfg *base.DownloaderProxyConfig) *base.DownloaderProxyConfig {
+		proxyCfg.System = true
+		return proxyCfg
+	}, nil)
+	// Enable proxy but error proxy environment variable
+	doTestDownloaderCreateWithProxy(t, false, nil, func(proxyCfg *base.DownloaderProxyConfig) *base.DownloaderProxyConfig {
+		os.Setenv("HTTP_PROXY", "http://127.0.0.1:1234")
+		os.Setenv("HTTPS_PROXY", "http://127.0.0.1:1234")
+		proxyCfg.System = true
+		return proxyCfg
+	}, func(err error) {
+		if err == nil {
+			t.Fatal("doTestDownloaderCreateWithProxy() got = nil, want error")
+		}
+	})
+	// Enable system proxy and set proxy environment variable
+	doTestDownloaderCreateWithProxy(t, false, nil, func(proxyCfg *base.DownloaderProxyConfig) *base.DownloaderProxyConfig {
+		os.Setenv("HTTP_PROXY", proxyCfg.ToUrl().String())
+		os.Setenv("HTTPS_PROXY", proxyCfg.ToUrl().String())
+		proxyCfg.System = true
+		return proxyCfg
+	}, nil)
+	// Invalid proxy scheme
+	doTestDownloaderCreateWithProxy(t, false, nil, func(proxyCfg *base.DownloaderProxyConfig) *base.DownloaderProxyConfig {
+		proxyCfg.Scheme = ""
+		return proxyCfg
+	}, nil)
+	// Invalid proxy host
+	doTestDownloaderCreateWithProxy(t, false, nil, func(proxyCfg *base.DownloaderProxyConfig) *base.DownloaderProxyConfig {
+		proxyCfg.Host = ""
+		return proxyCfg
+	}, nil)
+	// Use proxy without auth
+	doTestDownloaderCreateWithProxy(t, false, nil, func(proxyCfg *base.DownloaderProxyConfig) *base.DownloaderProxyConfig {
+		return proxyCfg
+	}, nil)
+	// Use proxy with auth
+	doTestDownloaderCreateWithProxy(t, true, nil, func(proxyCfg *base.DownloaderProxyConfig) *base.DownloaderProxyConfig {
+		return proxyCfg
+	}, nil)
+
+	// Request proxy mode follow
+	doTestDownloaderCreateWithProxy(t, false, func(reqProxy *base.RequestProxy) *base.RequestProxy {
+		reqProxy.Mode = base.RequestProxyModeFollow
+		return reqProxy
+	}, nil, nil)
+
+	// Request proxy mode none
+	doTestDownloaderCreateWithProxy(t, false, func(reqProxy *base.RequestProxy) *base.RequestProxy {
+		reqProxy.Mode = base.RequestProxyModeNone
+		return reqProxy
+	}, nil, nil)
+
+	// Request proxy mode custom
+	doTestDownloaderCreateWithProxy(t, false, func(reqProxy *base.RequestProxy) *base.RequestProxy {
+		return reqProxy
+	}, nil, nil)
+}
+
+func doTestDownloaderCreateWithProxy(t *testing.T, auth bool, buildReqProxy func(reqProxy *base.RequestProxy) *base.RequestProxy, buildProxyConfig func(proxyCfg *base.DownloaderProxyConfig) *base.DownloaderProxyConfig, errHandler func(err error)) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	usr, pwd := "", ""
+	if auth {
+		usr, pwd = "admin", "123"
+	}
+	proxyListener := test.StartSocks5Server(usr, pwd)
+	defer proxyListener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	globalProxyCfg := &base.DownloaderProxyConfig{
+		Enable: true,
+		Scheme: "socks5",
+		Host:   proxyListener.Addr().String(),
+		Usr:    usr,
+		Pwd:    pwd,
+	}
+	if buildProxyConfig != nil {
+		globalProxyCfg = buildProxyConfig(globalProxyCfg)
+	}
+	downloader.cfg.DownloaderStoreConfig.Proxy = globalProxyCfg
+
+	req := &base.Request{
+		URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+	}
+	if buildReqProxy != nil {
+		req.Proxy = buildReqProxy(&base.RequestProxy{
+			Scheme: "socks5",
+			Host:   proxyListener.Addr().String(),
+			Usr:    usr,
+			Pwd:    pwd,
+		})
+	}
+	rr, err := downloader.Resolve(req)
+	if err != nil {
+		if errHandler == nil {
+			t.Fatal(err)
+		}
+		errHandler(err)
+		return
+	}
+	want := &base.Resource{
+		Size:  test.BuildSize,
+		Range: true,
+		Files: []*base.FileInfo{
+			{
+				Name: test.BuildName,
+				Path: "",
+				Size: test.BuildSize,
+			},
+		},
+	}
+	if !test.AssertResourceEqual(want, rr.Res) {
+		t.Errorf("Resolve() got = %v, want %v", rr.Res, want)
+	}
+}
+
+func TestDownloader_CreateRename(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	req := &base.Request{
+		URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+	}
+	downloadDir := t.TempDir()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			wg.Done()
+		}
+	})
+	for i := 0; i < 2; i++ {
+		_, err := downloader.CreateDirect(req, &base.Options{
+			Path: downloadDir,
+			Name: test.DownloadName,
+			Extra: http.OptsExtra{
+				Connections: 4,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	wg.Wait()
+
+	want := test.FileMd5(test.BuildFile)
+	got := test.FileMd5(filepath.Join(downloadDir, test.DownloadName))
+	if want != got {
+		t.Errorf("Downloader_CreateRename() got = %v, want %v", got, want)
+	}
+	got = test.FileMd5(filepath.Join(downloadDir, test.DownloadRename))
+	if want != got {
+		t.Errorf("Downloader_CreateRename() got = %v, want %v", got, want)
+	}
+}
+
+func TestDownloader_IsFirstLoadSurvivesTheConfigClone(t *testing.T) {
+	d := NewDownloader(&DownloaderConfig{StorageDir: t.TempDir(), TempDir: t.TempDir()})
+	if err := d.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	if !d.IsFirstLoad() {
+		t.Fatal("a downloader that created its config reports IsFirstLoad() = false")
+	}
+	// GetConfig clones through json and FirstLoad is not serialized, so the cmd
+	// layer cannot read the flag from the returned config.
+	cfg, err := d.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FirstLoad {
+		t.Fatal("the cloned config must not report the first load")
+	}
+	if err := d.PutConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if d.IsFirstLoad() {
+		t.Fatal("a downloader that stored its config reports IsFirstLoad() = true")
+	}
+}
+
+func TestDownloader_StoreAndRestore(t *testing.T) {
+	listener := test.StartTestSlowFileServer(time.Millisecond * 2000)
+	defer listener.Close()
+
+	storageDir := t.TempDir()
+	downloader := NewDownloader(&DownloaderConfig{
+		Storage: NewBoltStorage(storageDir),
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	req := &base.Request{
+		URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+	}
+	opts := newTestDownloadOpt(t)
+	rr, err := downloader.Resolve(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pauseResult := make(chan error, 1)
+	var pauseOnce sync.Once
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyStart {
+			pauseOnce.Do(func() {
+				pauseResult <- downloader.Pause(&TaskFilter{IDs: []string{event.Task.ID}})
+			})
+		}
+	})
+	id, err := downloader.CreateWithOptions(rr.ID, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-pauseResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for task to pause")
+	}
+	downloader.Close()
+
+	downloader = NewDownloader(&DownloaderConfig{
+		Storage: NewBoltStorage(storageDir),
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	task := downloader.GetTask(id)
+
+	if task == nil {
+		t.Fatal("task is nil")
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			wg.Done()
+		}
+	})
+	err = downloader.Continue(&TaskFilter{IDs: []string{id}})
+	wg.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := test.FileMd5(test.BuildFile)
+	got := test.FileMd5(filepath.Join(opts.Path, opts.Name))
+	if want != got {
+		t.Errorf("StoreAndResume() got = %v, want %v", got, want)
+	}
+
+	downloader.Clear()
+}
+
+func TestDownloader_Protocol_Config(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	var httpCfg map[string]any
+	exits := downloader.getProtocolConfig("http", &httpCfg)
+	if !exits {
+		t.Errorf("getProtocolConfig() got = %v, want %v", exits, true)
+	}
+
+	storeCfg := &base.DownloaderStoreConfig{
+		DownloadDir: "./downloads",
+		ProtocolConfig: map[string]any{
+			"http": map[string]any{
+				"connections": 4,
+			},
+			"bt": map[string]any{
+				"trackerSubscribeUrls": []string{
+					"https://raw.githubusercontent.com/XIU2/TrackersListCollection/master/best.txt",
+				},
+				"customTrackers": []string{
+					"udp://tracker.coppersurfer.tk:6969/announce",
+					"udp://tracker.leechers-paradise.org:6969/announce",
+				},
+			},
+		},
+		Extra: map[string]any{
+			"theme": "dark",
+		},
+	}
+
+	if err := downloader.PutConfig(storeCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	newStoreCfg, err := downloader.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if newStoreCfg.DownloadDir != storeCfg.DownloadDir || newStoreCfg.Extra["theme"] != "dark" {
+		t.Fatalf("downloader config was not saved: %+v", newStoreCfg)
+	}
+	var savedHTTP struct {
+		Connections int `json:"connections"`
+	}
+	if err := util.MapToStruct(newStoreCfg.ProtocolConfig["http"], &savedHTTP); err != nil || savedHTTP.Connections != 4 {
+		t.Fatalf("HTTP config: %+v %v", savedHTTP, err)
+	}
+	var savedBT struct {
+		CustomTrackers []string `json:"customTrackers"`
+	}
+	if err := util.MapToStruct(newStoreCfg.ProtocolConfig["bt"], &savedBT); err != nil || len(savedBT.CustomTrackers) != 2 {
+		t.Fatalf("BT derived trackers: %+v %v", savedBT, err)
+	}
+}
+
+func TestDownloader_GetTasksByFilter(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		downloader.Delete(nil, true)
+		downloader.Clear()
+	}()
+
+	reqs := make([]*base.CreateTaskBatchItem, 0)
+	fileNames := make([]string, 0)
+	for i := 0; i < 10; i++ {
+		req := &base.Request{
+			URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+		}
+		reqs = append(reqs, &base.CreateTaskBatchItem{
+			Req: req,
+		})
+		if i == 0 {
+			fileNames = append(fileNames, test.DownloadName)
+		} else {
+			arr := strings.Split(test.DownloadName, ".")
+			fileNames = append(fileNames, arr[0]+" ("+strconv.Itoa(i)+")."+arr[1])
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(len(reqs))
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			wg.Done()
+		}
+	})
+
+	batchOpts := newTestDownloadOpt(t)
+	batchResult, err := downloader.CreateDirectBatch(&base.CreateTaskBatch{
+		Reqs: reqs,
+		Opts: batchOpts,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskIds := batchResult
+
+	wg.Wait()
+
+	t.Run("GetTasksByFilter nil", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(nil)
+		if len(tasks) != len(reqs) {
+			t.Errorf("GetTasksByFilter nil task got = %v, want %v", len(tasks), len(reqs))
+		}
+	})
+
+	t.Run("GetTasksByFilter empty", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(&TaskFilter{})
+		if len(tasks) != len(reqs) {
+			t.Errorf("GetTasksByFilter empty task got = %v, want %v", len(tasks), len(reqs))
+		}
+	})
+
+	t.Run("GetTasksByFilter ids", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(&TaskFilter{
+			IDs: taskIds,
+		})
+		if len(tasks) != len(reqs) {
+			t.Errorf("GetTasksByFilter ids task got = %v, want %v", len(tasks), len(reqs))
+		}
+	})
+
+	t.Run("GetTasksByFilter match ids", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(&TaskFilter{
+			IDs: []string{taskIds[0]},
+		})
+		if len(tasks) != 1 {
+			t.Errorf("GetTasksByFilter ids task got = %v, want %v", len(tasks), 1)
+		}
+	})
+
+	t.Run("GetTasksByFilter not match ids", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(&TaskFilter{
+			IDs: []string{"xxx"},
+		})
+		if len(tasks) != 0 {
+			t.Errorf("GetTasksByFilter ids task got = %v, want %v", len(tasks), 0)
+		}
+	})
+
+	t.Run("GetTasksByFilter status", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(&TaskFilter{
+			Statuses: []base.Status{base.DownloadStatusDone},
+		})
+		if len(tasks) != len(reqs) {
+			t.Errorf("GetTasksByFilter status task got = %v, want %v", len(tasks), len(reqs))
+		}
+	})
+
+	t.Run("GetTasksByFilter not match status", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(&TaskFilter{
+			Statuses: []base.Status{base.DownloadStatusError},
+		})
+		if len(tasks) != 0 {
+			t.Errorf("GetTasksByFilter status task got = %v, want %v", len(tasks), 0)
+		}
+	})
+
+	t.Run("GetTasksByFilter match notStatus", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(&TaskFilter{
+			NotStatuses: []base.Status{base.DownloadStatusRunning, base.DownloadStatusPause},
+		})
+		if len(tasks) != len(reqs) {
+			t.Errorf("GetTasksByFilter match notStatus task got = %v, want %v", len(tasks), len(reqs))
+		}
+	})
+
+	t.Run("GetTasksByFilter not match notStatus", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(&TaskFilter{
+			NotStatuses: []base.Status{base.DownloadStatusDone},
+		})
+		if len(tasks) != 0 {
+			t.Errorf("GetTasksByFilter not match notStatus task got = %v, want %v", len(tasks), 0)
+		}
+	})
+
+	t.Run("GetTasksByFilter match ids and status", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(&TaskFilter{
+			IDs:      []string{taskIds[0]},
+			Statuses: []base.Status{base.DownloadStatusDone},
+		})
+		if len(tasks) != 1 {
+			t.Errorf("GetTasksByFilter match ids and status task got = %v, want %v", len(tasks), 1)
+		}
+	})
+
+	t.Run("GetTasksByFilter not match ids and status", func(t *testing.T) {
+		tasks := downloader.GetTasksByFilter(&TaskFilter{
+			IDs:      []string{taskIds[0]},
+			Statuses: []base.Status{base.DownloadStatusError},
+		})
+		if len(tasks) != 0 {
+			t.Errorf("GetTasksByFilter not match ids and status task got = %v, want %v", len(tasks), 0)
+		}
+	})
+
+}
+
+func TestDownloader_Stats(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Test Stats for non-existent task
+	_, err := downloader.Stats("non-existent-id")
+	if err != ErrTaskNotFound {
+		t.Errorf("Stats() expected ErrTaskNotFound, got %v", err)
+	}
+
+	// Create a task
+	req := &base.Request{
+		URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+	}
+	rr, err := downloader.Resolve(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			wg.Done()
+		}
+	})
+
+	taskId, err := downloader.CreateWithOptions(rr.ID, newTestDownloadOpt(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wg.Wait()
+
+	// Test Stats for existing task
+	stats, err := downloader.Stats(taskId)
+	if err != nil {
+		t.Errorf("Stats() unexpected error: %v", err)
+	}
+	if stats == nil {
+		t.Error("Stats() returned nil stats")
+	}
+	statsFrame, ok := stats.(*fetcher.Stats)
+	if !ok {
+		t.Fatalf("Stats() type = %T, want *fetcher.Stats", stats)
+	}
+	httpStats, ok := statsFrame.Snapshot.(*http.Stats)
+	if !ok {
+		t.Fatalf("Stats().Snapshot type = %T, want *http.Stats", statsFrame.Snapshot)
+	}
+	for index, connection := range httpStats.Connections {
+		if !connection.Completed && !connection.Failed {
+			t.Fatalf("completed task connection %d was still active", index)
+		}
+	}
+}
+
+func TestDownloader_TaskStatsPersistsSnapshotWithoutRuntime(t *testing.T) {
+	downloader := NewDownloader(&DownloaderConfig{Storage: NewBoltStorage(t.TempDir())})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	task := &Task{
+		ID:       "stats-snapshot",
+		Status:   base.DownloadStatusPause,
+		Progress: &Progress{},
+		fetcher: &generationTestFetcher{stats: &fetcher.Stats{
+			Snapshot: map[string]any{"downloaded": float64(42)},
+			Runtime:  map[string]any{"activePeers": float64(7)},
+		}},
+	}
+	initTask(task)
+
+	if err := downloader.captureTaskStats(task, true, true); err != nil {
+		t.Fatal(err)
+	}
+	task.statsLock.Lock()
+	liveFrame := task.stats
+	task.statsLock.Unlock()
+	if liveFrame.Runtime == nil {
+		t.Fatal("running task lost runtime stats")
+	}
+
+	// Simulate a freshly restored protocol that is still verifying its local
+	// pieces. A nil Snapshot must keep the last trusted persisted value while
+	// allowing current Runtime telemetry to refresh.
+	task.statsLock.Lock()
+	task.statsLoaded = false
+	task.stats = nil
+	task.statsSnapshot = nil
+	task.statsLock.Unlock()
+	task.fetcher.(*generationTestFetcher).stats = &fetcher.Stats{
+		Runtime: map[string]any{"activePeers": float64(9)},
+	}
+	if err := downloader.captureTaskStats(task, true, true); err != nil {
+		t.Fatal(err)
+	}
+	task.statsLock.Lock()
+	verifyingFrame := task.stats
+	task.statsLock.Unlock()
+	if verifyingFrame == nil || verifyingFrame.Runtime.(map[string]any)["activePeers"] != float64(9) {
+		t.Fatalf("verifying runtime = %+v", verifyingFrame)
+	}
+	if _, ok := verifyingFrame.Snapshot.(json.RawMessage); !ok {
+		t.Fatalf("verifying snapshot type = %T, want persisted json.RawMessage", verifyingFrame.Snapshot)
+	}
+
+	// Simulate a fresh process: no fetcher and an empty task-level cache.
+	task.fetcher = nil
+	task.Status = base.DownloadStatusPause
+	task.statsLock.Lock()
+	task.statsLoaded = false
+	task.stats = nil
+	task.statsSnapshot = nil
+	task.statsLock.Unlock()
+	downloader.lock.Lock()
+	downloader.tasks = append(downloader.tasks, task)
+	downloader.lock.Unlock()
+
+	restored, err := downloader.Stats(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredFrame := restored.(*fetcher.Stats)
+	if restoredFrame.Runtime != nil {
+		t.Fatalf("persisted runtime = %+v, want nil", restoredFrame.Runtime)
+	}
+	raw, ok := restoredFrame.Snapshot.(json.RawMessage)
+	if !ok {
+		t.Fatalf("persisted snapshot type = %T", restoredFrame.Snapshot)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot["downloaded"] != float64(42) {
+		t.Fatalf("persisted snapshot = %+v", snapshot)
+	}
+}
+
+func TestDownloader_StatsDoesNotRestoreOrConsumeFetcherSave(t *testing.T) {
+	downloader := NewDownloader(&DownloaderConfig{Storage: NewBoltStorage(t.TempDir())})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	task := &Task{ID: "stats-no-restore", Status: base.DownloadStatusPause, Progress: &Progress{}}
+	initTask(task)
+	downloader.lock.Lock()
+	downloader.tasks = append(downloader.tasks, task)
+	downloader.lock.Unlock()
+	if err := downloader.storage.Put(bucketSave, task.ID, map[string]any{"downloaded": 12}); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := downloader.Stats(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats != nil {
+		t.Fatalf("missing task stats = %+v, want nil", stats)
+	}
+	var recovery map[string]any
+	exists, err := downloader.storage.Get(bucketSave, task.ID, &recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || recovery["downloaded"] != float64(12) {
+		t.Fatalf("fetcher recovery was consumed: exists=%v data=%+v", exists, recovery)
+	}
+}
+
+func TestDownloader_RestoreFetcherDoesNotConsumeSave(t *testing.T) {
+	storage := NewMemStorage()
+	if err := storage.Setup([]string{bucketSave, bucketConfig}); err != nil {
+		t.Fatal(err)
+	}
+	manager := newRecoveryTestManager()
+	downloader := NewDownloader(&DownloaderConfig{
+		Storage:               storage,
+		FetchManagers:         []fetcher.FetcherManager{manager},
+		DownloaderStoreConfig: (&base.DownloaderStoreConfig{}).Init(),
+	})
+	task := &Task{
+		ID:             "restore-keeps-checkpoint",
+		Meta:           &fetcher.FetcherMeta{Req: &base.Request{URL: "generation://restore"}},
+		Progress:       &Progress{},
+		fetcherManager: manager,
+	}
+	initTask(task)
+	if err := storage.Put(bucketSave, task.ID, &recoveryTestData{SeedBytes: 42}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := downloader.restoreFetcher(task); err != nil {
+		t.Fatal(err)
+	}
+	restored := task.fetcher.(*recoveryTestFetcher).data
+	if restored.SeedBytes != 42 {
+		t.Fatalf("restored seed bytes = %d, want 42", restored.SeedBytes)
+	}
+	var checkpoint recoveryTestData
+	exists, err := storage.Get(bucketSave, task.ID, &checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || checkpoint.SeedBytes != 42 {
+		t.Fatalf("restore consumed checkpoint: exists=%v data=%+v", exists, checkpoint)
+	}
+}
+
+func TestShouldSaveTaskCheckpoint(t *testing.T) {
+	if uploadCheckpointInterval != 30*time.Second {
+		t.Fatalf("upload checkpoint interval = %s, want 30s", uploadCheckpointInterval)
+	}
+	tests := []struct {
+		name                string
+		downloadChanged     bool
+		uploadChanged       bool
+		uploading           bool
+		uploadCheckpointDue bool
+		want                bool
+	}{
+		{name: "download changed", downloadChanged: true, want: true},
+		{name: "upload changed", uploadChanged: true, want: true},
+		{name: "active upload checkpoint due", uploading: true, uploadCheckpointDue: true, want: true},
+		{name: "active upload checkpoint not due", uploading: true, want: false},
+		{name: "inactive task checkpoint due", uploadCheckpointDue: true, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldSaveTaskCheckpoint(
+				tt.downloadChanged,
+				tt.uploadChanged,
+				tt.uploading,
+				tt.uploadCheckpointDue,
+			)
+			if got != tt.want {
+				t.Fatalf("shouldSaveTaskCheckpoint() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDownloader_CompletedHTTPStatsSurviveRestore(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	storageDir := t.TempDir()
+	downloader := NewDownloader(&DownloaderConfig{Storage: NewBoltStorage(storageDir)})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	req := &base.Request{URL: "http://" + listener.Addr().String() + "/" + test.BuildName}
+	rr, err := downloader.Resolve(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{}, 1)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			done <- struct{}{}
+		}
+	})
+	taskID, err := downloader.CreateWithOptions(rr.ID, newTestDownloadOpt(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for HTTP task completion")
+	}
+	beforeRestoreValue, err := downloader.Stats(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeRestore := decodeHTTPStatsSnapshot(t, beforeRestoreValue)
+	if err := downloader.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	downloader = NewDownloader(&DownloaderConfig{Storage: NewBoltStorage(storageDir)})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+
+	statsValue, err := downloader.Stats(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := decodeHTTPStatsSnapshot(t, statsValue)
+	if len(stats.Connections) == 0 {
+		t.Fatal("restored completed task has no HTTP connection stats")
+	}
+	if !reflect.DeepEqual(stats, beforeRestore) {
+		t.Fatalf("restored stats changed\nbefore: %+v\nafter:  %+v", beforeRestore, stats)
+	}
+	var downloaded int64
+	for _, connection := range stats.Connections {
+		downloaded += connection.Downloaded
+	}
+	if downloaded != test.BuildSize {
+		t.Fatalf("restored connection downloads = %d, want %d", downloaded, test.BuildSize)
+	}
+	if err := downloader.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restoring stats must not consume the persisted snapshot. Completed tasks
+	// do not write another checkpoint, so verify a second restart as well.
+	downloader = NewDownloader(&DownloaderConfig{Storage: NewBoltStorage(storageDir)})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	statsValue, err = downloader.Stats(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRestore := decodeHTTPStatsSnapshot(t, statsValue)
+	if !reflect.DeepEqual(secondRestore, beforeRestore) {
+		t.Fatalf("stats changed after second restart\nbefore: %+v\nafter:  %+v", beforeRestore, secondRestore)
+	}
+}
+
+func decodeHTTPStatsSnapshot(t *testing.T, value any) *http.Stats {
+	t.Helper()
+	frame, ok := value.(*fetcher.Stats)
+	if !ok {
+		t.Fatalf("stats type = %T, want *fetcher.Stats", value)
+	}
+	switch snapshot := frame.Snapshot.(type) {
+	case *http.Stats:
+		return snapshot
+	case json.RawMessage:
+		var stats http.Stats
+		if err := json.Unmarshal(snapshot, &stats); err != nil {
+			t.Fatal(err)
+		}
+		return &stats
+	default:
+		t.Fatalf("HTTP snapshot type = %T", frame.Snapshot)
+		return nil
+	}
+}
+
+func TestDownloader_Delete(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Create multiple tasks
+	var wg sync.WaitGroup
+	taskCount := 3
+	downloadDir := t.TempDir()
+	wg.Add(taskCount)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			wg.Done()
+		}
+	})
+
+	taskIds := make([]string, 0)
+	for i := 0; i < taskCount; i++ {
+		req := &base.Request{
+			URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+		}
+		taskId, err := downloader.CreateDirect(req, newTestDownloadOptAt(downloadDir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskIds = append(taskIds, taskId)
+	}
+
+	wg.Wait()
+
+	// Test Delete with filter (single task)
+	t.Run("Delete single task by ID", func(t *testing.T) {
+		initialCount := len(downloader.GetTasks())
+		err := downloader.Delete(&TaskFilter{IDs: []string{taskIds[0]}}, true)
+		if err != nil {
+			t.Errorf("Delete() unexpected error: %v", err)
+		}
+		newCount := len(downloader.GetTasks())
+		if newCount != initialCount-1 {
+			t.Errorf("Delete() task count got = %v, want %v", newCount, initialCount-1)
+		}
+	})
+
+	// Test Delete with non-matching filter (should do nothing)
+	t.Run("Delete with non-matching filter", func(t *testing.T) {
+		initialCount := len(downloader.GetTasks())
+		err := downloader.Delete(&TaskFilter{IDs: []string{"non-existent-id"}}, true)
+		if err != nil {
+			t.Errorf("Delete() unexpected error: %v", err)
+		}
+		newCount := len(downloader.GetTasks())
+		if newCount != initialCount {
+			t.Errorf("Delete() task count got = %v, want %v", newCount, initialCount)
+		}
+	})
+
+	// Test Delete by status
+	t.Run("Delete by status", func(t *testing.T) {
+		initialCount := len(downloader.GetTasks())
+		err := downloader.Delete(&TaskFilter{Statuses: []base.Status{base.DownloadStatusDone}}, false)
+		if err != nil {
+			t.Errorf("Delete() unexpected error: %v", err)
+		}
+		newCount := len(downloader.GetTasks())
+		if newCount != 0 {
+			t.Errorf("Delete() should have deleted all done tasks, got %v remaining", newCount)
+		}
+		_ = initialCount // suppress unused variable warning
+	})
+}
+
+func TestDownloader_PauseAndContinue(t *testing.T) {
+	listener := test.StartTestSlowFileServer(time.Millisecond * 2000)
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Create a single task
+	req := &base.Request{
+		URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+	}
+	rr, err := downloader.Resolve(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskId, err := downloader.CreateWithOptions(rr.ID, newTestDownloadOpt(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for task to start
+	time.Sleep(time.Millisecond * 100)
+
+	// Pause with specific taskId
+	err = downloader.Pause(&TaskFilter{IDs: []string{taskId}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(time.Millisecond * 100)
+
+	// Verify task is paused
+	task := downloader.GetTask(taskId)
+	if task.Status != base.DownloadStatusPause {
+		t.Errorf("Task should be paused, got %s", task.Status)
+	}
+
+	// Continue with specific taskId
+	var wg sync.WaitGroup
+	wg.Add(1)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			wg.Done()
+		}
+	})
+
+	err = downloader.Continue(&TaskFilter{IDs: []string{taskId}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for task to complete
+	wg.Wait()
+
+	// Verify task is done
+	task = downloader.GetTask(taskId)
+	if task.Status != base.DownloadStatusDone {
+		t.Errorf("Task should be done, got %s", task.Status)
+	}
+
+	// Clean up
+	downloader.Delete(nil, true)
+}
+
+func TestDownloader_FailedTaskSurvivesRestart(t *testing.T) {
+	storageDir := t.TempDir()
+	manager := &generationTestManager{holdOpen: true}
+	downloader := NewDownloader(&DownloaderConfig{
+		FetchManagers: []fetcher.FetcherManager{manager},
+		Storage:       NewBoltStorage(storageDir),
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+
+	errorEvent := make(chan error, 1)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyError {
+			errorEvent <- event.Err
+		}
+	})
+	taskID, err := downloader.CreateDirect(&base.Request{URL: "generation://restart-failure"}, &base.Options{
+		Path: t.TempDir(),
+		Name: "failed.bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForTaskStatus(t, downloader, taskID, base.DownloadStatusRunning, 2*time.Second)
+
+	wantErr := errors.New("download failed before restart")
+	downloader.GetTask(taskID).fetcher.(*generationTestFetcher).done <- wantErr
+	select {
+	case got := <-errorEvent:
+		if !errors.Is(got, wantErr) {
+			t.Fatalf("error event = %v, want %v", got, wantErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for task failure")
+	}
+	waitForTaskStatus(t, downloader, taskID, base.DownloadStatusError, 2*time.Second)
+
+	var stored Task
+	exists, err := downloader.storage.Get(bucketTask, taskID, &stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || stored.Status != base.DownloadStatusError {
+		t.Fatalf("persisted task status = %s, exists = %t; want error", stored.Status, exists)
+	}
+	if err := downloader.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	downloader = NewDownloader(&DownloaderConfig{
+		FetchManagers: []fetcher.FetcherManager{manager},
+		Storage:       NewBoltStorage(storageDir),
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+	if got := downloader.GetTask(taskID).Status; got != base.DownloadStatusError {
+		t.Fatalf("restored task status = %s, want error", got)
+	}
+}
+
+func TestDownloader_ContinueOnStartupUsesContinueAllSemantics(t *testing.T) {
+	manager := &generationTestManager{holdOpen: true}
+	downloader := NewDownloader(&DownloaderConfig{FetchManagers: []fetcher.FetcherManager{manager}})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	taskID, err := downloader.CreateDirect(&base.Request{URL: "generation://auto-start"}, &base.Options{
+		Path: t.TempDir(),
+		Name: "auto-start.bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForTaskStatus(t, downloader, taskID, base.DownloadStatusRunning, 2*time.Second)
+	if err := downloader.Pause(&TaskFilter{IDs: []string{taskID}}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := downloader.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Extra = map[string]any{"autoStartTasks": true}
+	if err := downloader.PutConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := downloader.ContinueOnStartup(); err != nil {
+		t.Fatal(err)
+	}
+	if got := downloader.taskStatus(downloader.GetTask(taskID)); got != base.DownloadStatusPause {
+		t.Fatalf("task status with auto-start disabled = %s, want pause", got)
+	}
+
+	cfg.AutoStartTasks = true
+	if err := downloader.PutConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := downloader.ContinueOnStartup(); err != nil {
+		t.Fatal(err)
+	}
+	waitForTaskStatus(t, downloader, taskID, base.DownloadStatusRunning, 2*time.Second)
+
+	downloader.GetTask(taskID).fetcher.(*generationTestFetcher).done <- errors.New("retry on next startup")
+	waitForTaskStatus(t, downloader, taskID, base.DownloadStatusError, 2*time.Second)
+	if err := downloader.ContinueOnStartup(); err != nil {
+		t.Fatal(err)
+	}
+	waitForTaskStatus(t, downloader, taskID, base.DownloadStatusRunning, 2*time.Second)
+}
+
+func TestDownloader_PauseAllAndContinueAll(t *testing.T) {
+	const targetDownloadDuration = time.Second
+	// Scale the per-byte delay with the configured connection count so a full
+	// ranged transfer stays near one second and is still running at Pause.
+	delayPerByte := targetDownloadDuration * testDownloadConnections / test.BuildSize
+	listener := test.StartTestLowSpeedServer(delayPerByte)
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Create multiple tasks
+	taskCount := 3
+	taskIds := make([]string, 0)
+
+	for i := 0; i < taskCount; i++ {
+		req := &base.Request{
+			URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+		}
+		rr, err := downloader.Resolve(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskId, err := downloader.CreateWithOptions(rr.ID, newTestDownloadOpt(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskIds = append(taskIds, taskId)
+	}
+
+	// Wait for tasks to start
+	time.Sleep(time.Millisecond * 100)
+
+	// Pause all tasks with nil filter
+	err := downloader.Pause(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(time.Millisecond * 100)
+
+	// Verify all tasks are paused
+	pausedCount := 0
+	for _, taskId := range taskIds {
+		task := downloader.GetTask(taskId)
+		if task.Status == base.DownloadStatusPause {
+			pausedCount++
+		}
+	}
+	if pausedCount != taskCount {
+		t.Errorf("Expected %d paused tasks, got %d", taskCount, pausedCount)
+	}
+
+	// Continue all tasks with nil filter
+	var wg sync.WaitGroup
+	wg.Add(taskCount)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			wg.Done()
+		}
+	})
+
+	err = downloader.Continue(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for all tasks to complete
+	wg.Wait()
+
+	// Verify all tasks are done
+	doneCount := 0
+	for _, taskId := range taskIds {
+		task := downloader.GetTask(taskId)
+		if task.Status == base.DownloadStatusDone {
+			doneCount++
+		}
+	}
+	if doneCount != taskCount {
+		t.Errorf("Expected %d done tasks, got %d", taskCount, doneCount)
+	}
+
+	// Clean up
+	downloader.Delete(nil, true)
+}
+
+func TestDownloader_GetTask(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Test GetTask for non-existent task
+	task := downloader.GetTask("non-existent-id")
+	if task != nil {
+		t.Errorf("GetTask() expected nil for non-existent task, got %v", task)
+	}
+}
+
+func TestDownloader_RuntimeStatus(t *testing.T) {
+	meta := &fetcher.FetcherMeta{
+		Res: &base.Resource{
+			Size: 20,
+			Files: []*base.FileInfo{
+				{Name: "skipped.bin", Size: 10},
+				{Name: "selected.bin", Size: 20},
+			},
+		},
+		Opts: &base.Options{SelectFiles: []int{1}},
+	}
+	task := &Task{
+		ID:       "runtime-status",
+		Status:   base.DownloadStatusRunning,
+		Meta:     meta,
+		Progress: &Progress{Used: 11, Speed: 12, Downloaded: 13, UploadSpeed: 14, Uploaded: 15},
+		fetcher:  &generationTestFetcher{manager: &generationTestManager{}, meta: meta},
+	}
+	initTask(task)
+	downloader := &Downloader{lock: &sync.Mutex{}, tasks: []*Task{task}}
+
+	status, err := downloader.RuntimeStatus(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != base.DownloadStatusRunning || status.Total != 20 || status.Downloaded != 13 {
+		t.Fatalf("unexpected runtime status: %+v", status)
+	}
+	if len(status.Files) != 1 {
+		t.Fatalf("len(status.Files) = %d, want 1", len(status.Files))
+	}
+	file := status.Files[0]
+	if file.Index != 1 || file.Size != 20 || file.Downloaded != 1 {
+		t.Fatalf("unexpected file runtime status: %+v", file)
+	}
+	if _, err := downloader.RuntimeStatus("missing"); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("missing task error = %v, want ErrTaskNotFound", err)
+	}
+}
+
+func TestDownloader_Emit(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Test emit with no listener (should not panic)
+	downloader.emit(EventKeyDone, nil)
+
+	// Test emit with listener
+	eventReceived := false
+	downloader.Listener(func(event *Event) {
+		eventReceived = true
+	})
+	downloader.emit(EventKeyDone, nil)
+	if !eventReceived {
+		t.Error("Event should have been received by listener")
+	}
+}
+
+func TestDownloader_AutoExtract(t *testing.T) {
+	// Create a temporary directory for extraction tests
+	tempDir, err := os.MkdirTemp("", "downloader_extract_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a test zip file
+	zipPath := tempDir + "/test_archive.zip"
+	if err := createTestArchive(zipPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify isArchiveFile works correctly
+	t.Run("isArchiveFile", func(t *testing.T) {
+		if !isArchiveFile(zipPath) {
+			t.Error("isArchiveFile should return true for .zip file")
+		}
+		if isArchiveFile(tempDir + "/test.txt") {
+			t.Error("isArchiveFile should return false for .txt file")
+		}
+	})
+}
+
+// TestDownloader_AutoExtractWithProgress tests the auto-extract functionality with progress tracking
+// This test exercises the ExtractStatus and ExtractProgress fields in the Progress struct
+func TestDownloader_AutoExtractWithProgress(t *testing.T) {
+	// Create a temporary directory for the test
+	tempDir, err := os.MkdirTemp("", "auto_extract_progress_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a test zip file to serve
+	zipPath := tempDir + "/archive.zip"
+	if err := createTestArchiveWithMultipleFiles(zipPath, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start a simple HTTP server to serve the zip file
+	server := startTestArchiveServer(zipPath)
+	defer server.Close()
+
+	// Create downloader
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Track extraction status changes
+	var extractStatusChanges []ExtractStatus
+	var extractProgressValues []int
+	var statusMutex sync.Mutex
+	extractDoneCh := make(chan struct{})
+	var extractDoneOnce sync.Once
+
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyProgress && event.Task != nil && event.Task.Progress != nil {
+			statusMutex.Lock()
+			status := event.Task.Progress.ExtractStatus
+			progress := event.Task.Progress.ExtractProgress
+			// Record status changes
+			if status != ExtractStatusNone {
+				if len(extractStatusChanges) == 0 || extractStatusChanges[len(extractStatusChanges)-1] != status {
+					extractStatusChanges = append(extractStatusChanges, status)
+				}
+				extractProgressValues = append(extractProgressValues, progress)
+			}
+			statusMutex.Unlock()
+			// Signal when extraction is done or errored
+			if status == ExtractStatusDone || status == ExtractStatusError {
+				extractDoneOnce.Do(func() {
+					close(extractDoneCh)
+				})
+			}
+		}
+	})
+
+	// Create request to download the zip file
+	req := &base.Request{
+		URL: "http://" + server.Addr().String() + "/archive.zip",
+	}
+
+	// Create task with AutoExtract enabled
+	downloadDir := tempDir + "/downloads"
+	taskId, err := downloader.CreateDirect(req, &base.Options{
+		Path: downloadDir,
+		Name: "archive.zip",
+		Extra: http.OptsExtra{
+			Connections: 1,
+			AutoExtract: util.BoolPtr(true),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for extraction to complete (with timeout)
+	select {
+	case <-extractDoneCh:
+		// Extraction completed
+	case <-time.After(30 * time.Second):
+		t.Log("Extraction timed out, checking results anyway")
+	}
+
+	// Give a small buffer for final events to be processed
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify task exists
+	task := downloader.GetTask(taskId)
+	if task == nil {
+		t.Fatal("Task should exist")
+	}
+
+	// Verify extraction status changes occurred
+	statusMutex.Lock()
+	defer statusMutex.Unlock()
+
+	t.Logf("Recorded extract status changes: %v", extractStatusChanges)
+	t.Logf("Recorded extract progress values: %v", extractProgressValues)
+
+	// Verify that we went through ExtractStatusExtracting
+	foundExtracting := false
+	for _, status := range extractStatusChanges {
+		if status == ExtractStatusExtracting {
+			foundExtracting = true
+			break
+		}
+	}
+	if !foundExtracting {
+		t.Error("Expected ExtractStatusExtracting in status changes")
+	}
+
+	// Verify that we reached ExtractStatusDone
+	foundDone := false
+	for _, status := range extractStatusChanges {
+		if status == ExtractStatusDone {
+			foundDone = true
+			break
+		}
+	}
+	if !foundDone {
+		t.Error("Expected ExtractStatusDone in status changes")
+	}
+
+	// Verify progress values include 100 (final)
+	found100 := false
+	for _, p := range extractProgressValues {
+		if p == 100 {
+			found100 = true
+			break
+		}
+	}
+	if !found100 {
+		t.Error("Expected progress to reach 100")
+	}
+
+	// Verify extracted files exist
+	extractedFile := downloadDir + "/test_0.txt"
+	if _, err := os.Stat(extractedFile); os.IsNotExist(err) {
+		t.Error("Expected extracted file to exist")
+	}
+}
+
+// TestDownloader_AutoExtractWithDeleteAfterExtract tests the auto-extract with DeleteAfterExtract option
+func TestDownloader_AutoExtractWithDeleteAfterExtract(t *testing.T) {
+	// Create a temporary directory for the test
+	tempDir, err := os.MkdirTemp("", "auto_extract_delete_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a test zip file to serve
+	zipPath := tempDir + "/archive.zip"
+	if err := createTestArchiveWithMultipleFiles(zipPath, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start a simple HTTP server to serve the zip file
+	server := startTestArchiveServer(zipPath)
+	defer server.Close()
+
+	// Create downloader
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Track extraction status changes
+	extractDoneCh := make(chan struct{})
+	var extractDoneOnce sync.Once
+
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyProgress && event.Task != nil && event.Task.Progress != nil {
+			status := event.Task.Progress.ExtractStatus
+			if status == ExtractStatusDone || status == ExtractStatusError {
+				extractDoneOnce.Do(func() {
+					close(extractDoneCh)
+				})
+			}
+		}
+	})
+
+	// Create request to download the zip file
+	req := &base.Request{
+		URL: "http://" + server.Addr().String() + "/archive.zip",
+	}
+
+	// Create task with AutoExtract and DeleteAfterExtract enabled
+	downloadDir := tempDir + "/downloads"
+	_, err = downloader.CreateDirect(req, &base.Options{
+		Path: downloadDir,
+		Name: "archive.zip",
+		Extra: http.OptsExtra{
+			Connections:        1,
+			AutoExtract:        util.BoolPtr(true),
+			DeleteAfterExtract: true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for extraction to complete (with timeout)
+	select {
+	case <-extractDoneCh:
+		// Extraction completed
+	case <-time.After(10 * time.Second):
+		t.Log("Extraction timed out")
+	}
+
+	// Give time for file deletion
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify archive was deleted
+	archivePath := downloadDir + "/archive.zip"
+	if _, err := os.Stat(archivePath); !os.IsNotExist(err) {
+		t.Error("Expected archive to be deleted after extraction")
+	}
+
+	// Verify extracted files exist
+	extractedFile := downloadDir + "/test_0.txt"
+	if _, err := os.Stat(extractedFile); os.IsNotExist(err) {
+		t.Error("Expected extracted file to exist")
+	}
+}
+
+// TestDownloader_AutoExtractError tests the auto-extract error handling path
+func TestDownloader_AutoExtractError(t *testing.T) {
+	// Create a temporary directory for the test
+	tempDir, err := os.MkdirTemp("", "auto_extract_error_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a corrupt zip file (just invalid data with .zip extension)
+	corruptZipPath := tempDir + "/corrupt.zip"
+	if err := os.WriteFile(corruptZipPath, []byte("this is not a valid zip file"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start a simple HTTP server to serve the corrupt zip file
+	server := startTestArchiveServer(corruptZipPath)
+	defer server.Close()
+
+	// Create downloader
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Track extraction status changes
+	var extractStatusChanges []ExtractStatus
+	var statusMutex sync.Mutex
+	extractDoneCh := make(chan struct{})
+	var extractDoneOnce sync.Once
+
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyProgress && event.Task != nil && event.Task.Progress != nil {
+			statusMutex.Lock()
+			status := event.Task.Progress.ExtractStatus
+			if status != ExtractStatusNone {
+				if len(extractStatusChanges) == 0 || extractStatusChanges[len(extractStatusChanges)-1] != status {
+					extractStatusChanges = append(extractStatusChanges, status)
+				}
+			}
+			statusMutex.Unlock()
+			if status == ExtractStatusDone || status == ExtractStatusError {
+				extractDoneOnce.Do(func() {
+					close(extractDoneCh)
+				})
+			}
+		}
+	})
+
+	// Create request to download the corrupt zip file
+	req := &base.Request{
+		URL: "http://" + server.Addr().String() + "/corrupt.zip",
+	}
+
+	// Create task with AutoExtract enabled
+	downloadDir := tempDir + "/downloads"
+	_, err = downloader.CreateDirect(req, &base.Options{
+		Path: downloadDir,
+		Name: "corrupt.zip",
+		Extra: http.OptsExtra{
+			Connections: 1,
+			AutoExtract: util.BoolPtr(true),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for extraction to complete (with timeout)
+	select {
+	case <-extractDoneCh:
+		// Extraction completed (should be error)
+	case <-time.After(10 * time.Second):
+		t.Log("Extraction timed out")
+	}
+
+	// Give a small buffer for final events to be processed
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify extraction status changes include error
+	statusMutex.Lock()
+	defer statusMutex.Unlock()
+
+	t.Logf("Recorded extract status changes: %v", extractStatusChanges)
+
+	// Verify that we went through ExtractStatusExtracting
+	foundExtracting := false
+	for _, status := range extractStatusChanges {
+		if status == ExtractStatusExtracting {
+			foundExtracting = true
+			break
+		}
+	}
+	if !foundExtracting {
+		t.Error("Expected ExtractStatusExtracting in status changes")
+	}
+
+	// Verify that we reached ExtractStatusError
+	foundError := false
+	for _, status := range extractStatusChanges {
+		if status == ExtractStatusError {
+			foundError = true
+			break
+		}
+	}
+	if !foundError {
+		t.Error("Expected ExtractStatusError in status changes")
+	}
+}
+
+// TestExtractStatus tests the ExtractStatus constants
+func TestExtractStatus(t *testing.T) {
+	tests := []struct {
+		status   ExtractStatus
+		expected string
+	}{
+		{ExtractStatusNone, ""},
+		{ExtractStatusQueued, "queued"},
+		{ExtractStatusExtracting, "extracting"},
+		{ExtractStatusDone, "done"},
+		{ExtractStatusError, "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.status), func(t *testing.T) {
+			if string(tt.status) != tt.expected {
+				t.Errorf("ExtractStatus %v = %q, want %q", tt.status, string(tt.status), tt.expected)
+			}
+		})
+	}
+}
+
+// TestProgress_ExtractFields tests the ExtractStatus and ExtractProgress fields in Progress struct
+func TestProgress_ExtractFields(t *testing.T) {
+	progress := &Progress{
+		ExtractStatus:   ExtractStatusExtracting,
+		ExtractProgress: 50,
+	}
+
+	if progress.ExtractStatus != ExtractStatusExtracting {
+		t.Errorf("ExtractStatus = %v, want %v", progress.ExtractStatus, ExtractStatusExtracting)
+	}
+	if progress.ExtractProgress != 50 {
+		t.Errorf("ExtractProgress = %v, want %v", progress.ExtractProgress, 50)
+	}
+
+	// Test status transitions
+	progress.ExtractStatus = ExtractStatusDone
+	progress.ExtractProgress = 100
+	if progress.ExtractStatus != ExtractStatusDone {
+		t.Errorf("ExtractStatus after update = %v, want %v", progress.ExtractStatus, ExtractStatusDone)
+	}
+	if progress.ExtractProgress != 100 {
+		t.Errorf("ExtractProgress after update = %v, want %v", progress.ExtractProgress, 100)
+	}
+}
+
+// TestProgress_MultiPartFields tests the multi-part archive fields in Progress struct
+func TestProgress_MultiPartFields(t *testing.T) {
+	progress := &Progress{
+		ExtractStatus:     ExtractStatusWaitingParts,
+		MultiPartBaseName: "/path/to/archive.7z",
+		MultiPartNumber:   1,
+		MultiPartIsFirst:  true,
+	}
+
+	if progress.ExtractStatus != ExtractStatusWaitingParts {
+		t.Errorf("ExtractStatus = %v, want %v", progress.ExtractStatus, ExtractStatusWaitingParts)
+	}
+	if progress.MultiPartBaseName != "/path/to/archive.7z" {
+		t.Errorf("MultiPartBaseName = %v, want %v", progress.MultiPartBaseName, "/path/to/archive.7z")
+	}
+	if progress.MultiPartNumber != 1 {
+		t.Errorf("MultiPartNumber = %v, want %v", progress.MultiPartNumber, 1)
+	}
+	if !progress.MultiPartIsFirst {
+		t.Error("MultiPartIsFirst should be true")
+	}
+
+	// Test second part
+	progress2 := &Progress{
+		ExtractStatus:     ExtractStatusWaitingParts,
+		MultiPartBaseName: "/path/to/archive.7z",
+		MultiPartNumber:   2,
+		MultiPartIsFirst:  false,
+	}
+
+	if progress2.MultiPartNumber != 2 {
+		t.Errorf("MultiPartNumber = %v, want %v", progress2.MultiPartNumber, 2)
+	}
+	if progress2.MultiPartIsFirst {
+		t.Error("MultiPartIsFirst should be false")
+	}
+}
+
+// TestExtractStatus_WaitingParts tests the new ExtractStatusWaitingParts status
+func TestExtractStatus_WaitingParts(t *testing.T) {
+	if ExtractStatusWaitingParts != "waitingParts" {
+		t.Errorf("ExtractStatusWaitingParts = %v, want %v", ExtractStatusWaitingParts, "waitingParts")
+	}
+}
+
+// createTestArchiveWithMultipleFiles creates a test zip file with multiple files
+func createTestArchiveWithMultipleFiles(path string, count int) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	zipWriter := zip.NewWriter(file)
+	defer zipWriter.Close()
+
+	for i := 0; i < count; i++ {
+		w, err := zipWriter.Create("test_" + strconv.Itoa(i) + ".txt")
+		if err != nil {
+			return err
+		}
+		_, err = w.Write([]byte("test content " + strconv.Itoa(i)))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// startTestArchiveServer starts a simple HTTP server that serves a zip file
+func startTestArchiveServer(zipPath string) net.Listener {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+
+	go func() {
+		gohttp.Serve(listener, gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+			file, err := os.Open(zipPath)
+			if err != nil {
+				gohttp.Error(w, err.Error(), gohttp.StatusInternalServerError)
+				return
+			}
+			defer file.Close()
+
+			stat, _ := file.Stat()
+			w.Header().Set("Content-Type", "application/zip")
+			w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
+			io.Copy(w, file)
+		}))
+	}()
+
+	return listener
+}
+
+// createTestArchive creates a simple test zip file for testing
+func createTestArchive(path string) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Create a simple zip archive
+	zipWriter := zip.NewWriter(file)
+	defer zipWriter.Close()
+
+	// Add a test file
+	w, err := zipWriter.Create("test.txt")
+	if err != nil {
+		return err
+	}
+	_, err = w.Write([]byte("test content"))
+	return err
+}
+
+func TestDownloader_Close(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close should not error
+	err := downloader.Close()
+	if err != nil {
+		t.Errorf("Close() unexpected error: %v", err)
+	}
+
+	// Calling Close again should not panic
+	err = downloader.Close()
+	if err != nil {
+		t.Errorf("Close() second call unexpected error: %v", err)
+	}
+}
+
+func TestDownloader_DeleteAll(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Create multiple tasks
+	var wg sync.WaitGroup
+	taskCount := 3
+	downloadDir := t.TempDir()
+	wg.Add(taskCount)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			wg.Done()
+		}
+	})
+
+	for i := 0; i < taskCount; i++ {
+		req := &base.Request{
+			URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+		}
+		_, err := downloader.CreateDirect(req, &base.Options{
+			Path: downloadDir,
+			Name: test.DownloadName,
+			Extra: http.OptsExtra{
+				Connections: 4,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	wg.Wait()
+
+	// Verify tasks were created
+	if len(downloader.GetTasks()) != taskCount {
+		t.Errorf("Expected %d tasks, got %d", taskCount, len(downloader.GetTasks()))
+	}
+
+	// Delete all tasks with nil filter
+	err := downloader.Delete(nil, true)
+	if err != nil {
+		t.Errorf("Delete(nil) unexpected error: %v", err)
+	}
+
+	// Verify all tasks are deleted
+	if len(downloader.GetTasks()) != 0 {
+		t.Errorf("All tasks should be deleted, got %d remaining", len(downloader.GetTasks()))
+	}
+}
+
+func TestDownloader_ProtocolConfigNotExist(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Test getting a protocol config that doesn't exist
+	var unknownCfg map[string]any
+	exists := downloader.getProtocolConfig("unknown-protocol", &unknownCfg)
+	if exists {
+		t.Errorf("getProtocolConfig() for unknown protocol should return false")
+	}
+}
+
+func TestTaskFilter_IsEmpty(t *testing.T) {
+	tests := []struct {
+		name     string
+		filter   *TaskFilter
+		expected bool
+	}{
+		{
+			name:     "nil IDs, Statuses, NotStatuses",
+			filter:   &TaskFilter{},
+			expected: true,
+		},
+		{
+			name:     "empty IDs only",
+			filter:   &TaskFilter{IDs: []string{}},
+			expected: true,
+		},
+		{
+			name:     "non-empty IDs",
+			filter:   &TaskFilter{IDs: []string{"id1"}},
+			expected: false,
+		},
+		{
+			name:     "non-empty Statuses",
+			filter:   &TaskFilter{Statuses: []base.Status{base.DownloadStatusDone}},
+			expected: false,
+		},
+		{
+			name:     "non-empty NotStatuses",
+			filter:   &TaskFilter{NotStatuses: []base.Status{base.DownloadStatusError}},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.filter.IsEmpty()
+			if result != tt.expected {
+				t.Errorf("TaskFilter.IsEmpty() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+// Tests for multi-part archive collection functions
+func TestDownloader_CollectSequentialFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "collect_sequential_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create test files for 7z multi-part pattern (archive.7z.001, .002, .003)
+	for i := 1; i <= 3; i++ {
+		path := filepath.Join(tempDir, fmt.Sprintf("archive.7z.%03d", i))
+		if err := os.WriteFile(path, []byte("test"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	downloader := NewDownloader(nil)
+	files := downloader.collectSequentialFiles(tempDir, "archive.7z", ".%03d")
+
+	if len(files) != 3 {
+		t.Errorf("collectSequentialFiles() = %d files, want 3", len(files))
+	}
+
+	// Verify files are in order
+	for i, file := range files {
+		expected := filepath.Join(tempDir, fmt.Sprintf("archive.7z.%03d", i+1))
+		if file != expected {
+			t.Errorf("files[%d] = %q, want %q", i, file, expected)
+		}
+	}
+}
+
+func TestDownloader_CollectSequentialFiles_NoFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "collect_sequential_empty_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	downloader := NewDownloader(nil)
+	files := downloader.collectSequentialFiles(tempDir, "archive.7z", ".%03d")
+
+	if len(files) != 0 {
+		t.Errorf("collectSequentialFiles() = %d files, want 0", len(files))
+	}
+}
+
+func TestDownloader_CollectRarNewStyleFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "collect_rar_new_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create test files with double-digit format
+	for i := 1; i <= 3; i++ {
+		path := filepath.Join(tempDir, fmt.Sprintf("archive.part%02d.rar", i))
+		if err := os.WriteFile(path, []byte("test"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	downloader := NewDownloader(nil)
+	files := downloader.collectRarNewStyleFiles(tempDir, "archive")
+
+	if len(files) != 3 {
+		t.Errorf("collectRarNewStyleFiles() = %d files, want 3", len(files))
+	}
+}
+
+func TestDownloader_CollectRarNewStyleFiles_SingleDigit(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "collect_rar_single_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create test files with single-digit format
+	for i := 1; i <= 2; i++ {
+		path := filepath.Join(tempDir, fmt.Sprintf("archive.part%d.rar", i))
+		if err := os.WriteFile(path, []byte("test"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	downloader := NewDownloader(nil)
+	files := downloader.collectRarNewStyleFiles(tempDir, "archive")
+
+	if len(files) != 2 {
+		t.Errorf("collectRarNewStyleFiles() = %d files, want 2", len(files))
+	}
+}
+
+func TestDownloader_CollectRarOldStyleFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "collect_rar_old_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create .rar file
+	rarPath := filepath.Join(tempDir, "archive.rar")
+	if err := os.WriteFile(rarPath, []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create .r00, .r01, .r02 files
+	for i := 0; i <= 2; i++ {
+		path := filepath.Join(tempDir, fmt.Sprintf("archive.r%02d", i))
+		if err := os.WriteFile(path, []byte("test"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	downloader := NewDownloader(nil)
+	files := downloader.collectRarOldStyleFiles(tempDir, "archive")
+
+	// Should have 4 files: .rar + .r00 + .r01 + .r02
+	if len(files) != 4 {
+		t.Errorf("collectRarOldStyleFiles() = %d files, want 4", len(files))
+	}
+
+	// First file should be .rar
+	if files[0] != rarPath {
+		t.Errorf("First file should be .rar, got %q", files[0])
+	}
+}
+
+func TestDownloader_CollectZipSplitFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "collect_zip_split_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create .z01, .z02 files
+	for i := 1; i <= 2; i++ {
+		path := filepath.Join(tempDir, fmt.Sprintf("archive.z%02d", i))
+		if err := os.WriteFile(path, []byte("test"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Create .zip file
+	zipPath := filepath.Join(tempDir, "archive.zip")
+	if err := os.WriteFile(zipPath, []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	downloader := NewDownloader(nil)
+	files := downloader.collectZipSplitFiles(tempDir, "archive")
+
+	// Should have 3 files: .z01 + .z02 + .zip
+	if len(files) != 3 {
+		t.Errorf("collectZipSplitFiles() = %d files, want 3", len(files))
+	}
+
+	// Last file should be .zip
+	if files[len(files)-1] != zipPath {
+		t.Errorf("Last file should be .zip, got %q", files[len(files)-1])
+	}
+}
+
+func TestDownloader_CollectMultiPartFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "collect_multipart_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Test with 7z pattern
+	t.Run("7z pattern", func(t *testing.T) {
+		subDir := filepath.Join(tempDir, "7z")
+		if err := os.MkdirAll(subDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		for i := 1; i <= 2; i++ {
+			path := filepath.Join(subDir, fmt.Sprintf("archive.7z.%03d", i))
+			if err := os.WriteFile(path, []byte("test"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		downloader := NewDownloader(nil)
+		firstPart := filepath.Join(subDir, "archive.7z.001")
+		files := downloader.collectMultiPartFiles(firstPart)
+
+		if len(files) != 2 {
+			t.Errorf("collectMultiPartFiles(7z) = %d files, want 2", len(files))
+		}
+	})
+
+	// Test with RAR new style pattern
+	t.Run("RAR new style pattern", func(t *testing.T) {
+		subDir := filepath.Join(tempDir, "rar_new")
+		if err := os.MkdirAll(subDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		for i := 1; i <= 2; i++ {
+			path := filepath.Join(subDir, fmt.Sprintf("archive.part%02d.rar", i))
+			if err := os.WriteFile(path, []byte("test"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		downloader := NewDownloader(nil)
+		firstPart := filepath.Join(subDir, "archive.part01.rar")
+		files := downloader.collectMultiPartFiles(firstPart)
+
+		if len(files) != 2 {
+			t.Errorf("collectMultiPartFiles(RAR new) = %d files, want 2", len(files))
+		}
+	})
+
+	// Test with ZIP multi-part pattern
+	t.Run("ZIP multi-part pattern", func(t *testing.T) {
+		subDir := filepath.Join(tempDir, "zip")
+		if err := os.MkdirAll(subDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		for i := 1; i <= 3; i++ {
+			path := filepath.Join(subDir, fmt.Sprintf("archive.zip.%03d", i))
+			if err := os.WriteFile(path, []byte("test"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		downloader := NewDownloader(nil)
+		firstPart := filepath.Join(subDir, "archive.zip.001")
+		files := downloader.collectMultiPartFiles(firstPart)
+
+		if len(files) != 3 {
+			t.Errorf("collectMultiPartFiles(ZIP) = %d files, want 3", len(files))
+		}
+	})
+}
+
+func TestDownloader_CheckAllMultiPartTasksDone(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	tempDir, err := os.MkdirTemp("", "check_multipart_done_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create tasks with multi-part base name
+	baseName := "archive.7z"
+
+	// Create task 1 - done
+	task1 := &Task{
+		ID:     "task1",
+		Status: base.DownloadStatusDone,
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: baseName + ".001"}},
+			},
+		},
+		Progress: &Progress{},
+	}
+	initTask(task1)
+
+	// Create task 2 - done
+	task2 := &Task{
+		ID:     "task2",
+		Status: base.DownloadStatusDone,
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: baseName + ".002"}},
+			},
+		},
+		Progress: &Progress{},
+	}
+	initTask(task2)
+
+	downloader.tasks = []*Task{task1, task2}
+
+	// All tasks are done
+	basePath := filepath.Join(tempDir, baseName)
+	allDone, missing := downloader.checkAllMultiPartTasksDone(basePath)
+	if !allDone {
+		t.Errorf("checkAllMultiPartTasksDone() = false, want true; missing: %v", missing)
+	}
+
+	// Set task2 to running
+	task2.Status = base.DownloadStatusRunning
+	allDone, missing = downloader.checkAllMultiPartTasksDone(basePath)
+	if allDone {
+		t.Error("checkAllMultiPartTasksDone() = true, want false")
+	}
+	if len(missing) == 0 {
+		t.Error("Expected missing parts to be reported")
+	}
+}
+
+func TestDownloader_CheckAllMultiPartTasksDone_NoRelatedTasks(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// No tasks exist
+	allDone, missing := downloader.checkAllMultiPartTasksDone("/some/path/archive.7z")
+	if allDone {
+		t.Error("checkAllMultiPartTasksDone() = true, want false with no related tasks")
+	}
+	if len(missing) == 0 {
+		t.Error("Expected missing message")
+	}
+}
+
+func TestDownloader_TryClaimMultiPartExtraction(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	tempDir, err := os.MkdirTemp("", "extraction_progress_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	baseName := "archive.7z"
+	// GetMultiPartArchiveBaseName returns filepath.Join(dir, baseName)
+	fullBaseName := filepath.Join(tempDir, baseName)
+
+	// Create tasks
+	task1 := &Task{
+		ID:     "task1",
+		Status: base.DownloadStatusDone,
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: baseName + ".001", Path: ""}},
+			},
+		},
+		Progress: &Progress{ExtractStatus: ExtractStatusNone},
+	}
+	initTask(task1)
+
+	task2 := &Task{
+		ID:     "task2",
+		Status: base.DownloadStatusDone,
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: baseName + ".002", Path: ""}},
+			},
+		},
+		Progress: &Progress{ExtractStatus: ExtractStatusNone},
+	}
+	initTask(task2)
+
+	downloader.tasks = []*Task{task1, task2}
+
+	// Task1 should be able to claim extraction (no one has claimed yet)
+	if !downloader.tryClaimMultiPartExtraction(task1, fullBaseName) {
+		t.Error("tryClaimMultiPartExtraction() = false, want true (first claim)")
+	}
+	// task1's status should now be Queued
+	if task1.Progress.ExtractStatus != ExtractStatusQueued {
+		t.Errorf("task1.ExtractStatus = %v, want %v", task1.Progress.ExtractStatus, ExtractStatusQueued)
+	}
+
+	// Task2 should NOT be able to claim (task1 already claimed via sync.Map)
+	if downloader.tryClaimMultiPartExtraction(task2, fullBaseName) {
+		t.Error("tryClaimMultiPartExtraction() = true, want false (already claimed)")
+	}
+
+	// Release the claim
+	downloader.releaseMultiPartExtractionClaim(fullBaseName)
+
+	// Now task2 CAN claim (claim was released)
+	if !downloader.tryClaimMultiPartExtraction(task2, fullBaseName) {
+		t.Error("tryClaimMultiPartExtraction() = false, want true (claim was released)")
+	}
+}
+
+func TestDownloader_HandleExtractionResult_Success(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	tempDir, err := os.MkdirTemp("", "extraction_result_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a test archive file
+	archivePath := filepath.Join(tempDir, "test.zip")
+	if err := os.WriteFile(archivePath, []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	task := &Task{
+		ID: "test-task",
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: "test.zip"}},
+			},
+		},
+		Progress: &Progress{},
+	}
+	initTask(task)
+
+	// Test successful extraction
+	downloader.handleExtractionResult(task, nil, []string{archivePath}, false)
+
+	if task.Progress.ExtractStatus != ExtractStatusDone {
+		t.Errorf("ExtractStatus = %v, want %v", task.Progress.ExtractStatus, ExtractStatusDone)
+	}
+	if task.Progress.ExtractProgress != 100 {
+		t.Errorf("ExtractProgress = %d, want 100", task.Progress.ExtractProgress)
+	}
+
+	// Archive should still exist (deleteAfterExtract=false)
+	if _, err := os.Stat(archivePath); os.IsNotExist(err) {
+		t.Error("Archive should still exist when deleteAfterExtract=false")
+	}
+}
+
+func TestDownloader_HandleExtractionResult_WithDelete(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	tempDir, err := os.MkdirTemp("", "extraction_delete_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create test archive files
+	archivePath1 := filepath.Join(tempDir, "test.7z.001")
+	archivePath2 := filepath.Join(tempDir, "test.7z.002")
+	if err := os.WriteFile(archivePath1, []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archivePath2, []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	task := &Task{
+		ID: "test-task",
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: "test.7z.001"}},
+			},
+		},
+		Progress: &Progress{},
+	}
+	initTask(task)
+
+	// Test successful extraction with delete
+	downloader.handleExtractionResult(task, nil, []string{archivePath1, archivePath2}, true)
+
+	if task.Progress.ExtractStatus != ExtractStatusDone {
+		t.Errorf("ExtractStatus = %v, want %v", task.Progress.ExtractStatus, ExtractStatusDone)
+	}
+
+	// Archives should be deleted
+	if _, err := os.Stat(archivePath1); !os.IsNotExist(err) {
+		t.Error("Archive 1 should be deleted when deleteAfterExtract=true")
+	}
+	if _, err := os.Stat(archivePath2); !os.IsNotExist(err) {
+		t.Error("Archive 2 should be deleted when deleteAfterExtract=true")
+	}
+}
+
+func TestDownloader_HandleExtractionResult_Error(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	tempDir, err := os.MkdirTemp("", "extraction_error_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	task := &Task{
+		ID: "test-task",
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: "test.zip"}},
+			},
+		},
+		Progress: &Progress{},
+	}
+	initTask(task)
+
+	// Test failed extraction
+	extractErr := fmt.Errorf("extraction failed")
+	downloader.handleExtractionResult(task, extractErr, nil, false)
+
+	if task.Progress.ExtractStatus != ExtractStatusError {
+		t.Errorf("ExtractStatus = %v, want %v", task.Progress.ExtractStatus, ExtractStatusError)
+	}
+}
+
+func TestDownloader_UpdateMultiPartTasksStatus(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	tempDir, err := os.MkdirTemp("", "update_status_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create source task with multi-part base name
+	sourceTask := &Task{
+		ID: "source",
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: "archive.7z.001"}},
+			},
+		},
+		Progress: &Progress{MultiPartBaseName: "archive.7z"},
+	}
+	initTask(sourceTask)
+
+	// Create related task
+	relatedTask := &Task{
+		ID: "related",
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: "archive.7z.002"}},
+			},
+		},
+		Progress: &Progress{MultiPartBaseName: "archive.7z"},
+	}
+	initTask(relatedTask)
+
+	// Create unrelated task
+	unrelatedTask := &Task{
+		ID: "unrelated",
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: "other.7z.001"}},
+			},
+		},
+		Progress: &Progress{MultiPartBaseName: "other.7z"},
+	}
+	initTask(unrelatedTask)
+
+	downloader.tasks = []*Task{sourceTask, relatedTask, unrelatedTask}
+
+	// Test successful extraction
+	downloader.updateMultiPartTasksStatus(sourceTask, nil)
+
+	if relatedTask.Progress.ExtractStatus != ExtractStatusDone {
+		t.Errorf("Related task ExtractStatus = %v, want %v", relatedTask.Progress.ExtractStatus, ExtractStatusDone)
+	}
+	if relatedTask.Progress.ExtractProgress != 100 {
+		t.Errorf("Related task ExtractProgress = %d, want 100", relatedTask.Progress.ExtractProgress)
+	}
+	if unrelatedTask.Progress.ExtractStatus == ExtractStatusDone {
+		t.Error("Unrelated task should not be updated")
+	}
+}
+
+func TestDownloader_UpdateMultiPartTasksStatus_WithError(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	tempDir, err := os.MkdirTemp("", "update_error_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create source task with multi-part base name
+	sourceTask := &Task{
+		ID: "source",
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: "archive.7z.001"}},
+			},
+		},
+		Progress: &Progress{MultiPartBaseName: "archive.7z"},
+	}
+	initTask(sourceTask)
+
+	// Create related task
+	relatedTask := &Task{
+		ID: "related",
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: "archive.7z.002"}},
+			},
+		},
+		Progress: &Progress{MultiPartBaseName: "archive.7z"},
+	}
+	initTask(relatedTask)
+
+	downloader.tasks = []*Task{sourceTask, relatedTask}
+
+	// Test failed extraction
+	downloader.updateMultiPartTasksStatus(sourceTask, fmt.Errorf("extraction failed"))
+
+	if relatedTask.Progress.ExtractStatus != ExtractStatusError {
+		t.Errorf("Related task ExtractStatus = %v, want %v", relatedTask.Progress.ExtractStatus, ExtractStatusError)
+	}
+	if relatedTask.Progress.ExtractProgress != 0 {
+		t.Errorf("Related task ExtractProgress = %d, want 0", relatedTask.Progress.ExtractProgress)
+	}
+}
+
+func TestDownloader_UpdateMultiPartTasksStatus_NoBaseName(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	tempDir, err := os.MkdirTemp("", "update_no_base_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create task without multi-part base name
+	task := &Task{
+		ID: "single",
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: "single.zip"}},
+			},
+		},
+		Progress: &Progress{MultiPartBaseName: ""},
+	}
+	initTask(task)
+
+	downloader.tasks = []*Task{task}
+
+	// Should not panic or error
+	downloader.updateMultiPartTasksStatus(task, nil)
+}
+
+func TestDownloader_CheckMultiPartArchiveReady(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	tempDir, err := os.MkdirTemp("", "check_ready_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	baseName := "archive.7z"
+	fileName := baseName + ".001"
+	filePath := filepath.Join(tempDir, fileName)
+
+	// Create tasks
+	task := &Task{
+		ID:     "task1",
+		Status: base.DownloadStatusDone,
+		Meta: &fetcher.FetcherMeta{
+			Opts: &base.Options{Path: tempDir},
+			Res: &base.Resource{
+				Files: []*base.FileInfo{{Name: fileName}},
+			},
+		},
+		Progress: &Progress{},
+	}
+	initTask(task)
+	downloader.tasks = []*Task{task}
+
+	partInfo := getArchivePartInfo(filePath)
+	ready, missing := downloader.checkMultiPartArchiveReady(filePath, tempDir, partInfo)
+
+	if !ready {
+		t.Errorf("checkMultiPartArchiveReady() = false, want true; missing: %v", missing)
+	}
+}
+
+func TestDownloader_CheckMultiPartArchiveReady_EmptyBaseName(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Use a non-multi-part file path
+	partInfo := getArchivePartInfo("/some/regular.zip")
+	ready, _ := downloader.checkMultiPartArchiveReady("/some/regular.zip", "/dest", partInfo)
+
+	// Should return true for non-multi-part files
+	if !ready {
+		t.Error("checkMultiPartArchiveReady() should return true for non-multi-part files")
+	}
+}
+
+// startTestTorrentServer starts a simple HTTP server that serves a torrent file
+func startTestTorrentServer(torrentPath string) net.Listener {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+
+	server := &gohttp.Server{
+		Handler: gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+			data, err := os.ReadFile(torrentPath)
+			if err != nil {
+				w.WriteHeader(gohttp.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-bittorrent")
+			w.Header().Set("Content-Disposition", "attachment; filename=ubuntu.torrent")
+			w.Write(data)
+		}),
+	}
+	go server.Serve(listener)
+	return listener
+}
+
+// TestDownloader_AutoTorrent tests the auto-torrent functionality
+// When a .torrent file is downloaded with AutoTorrent enabled, it should automatically create a BT task
+func TestDownloader_AutoTorrent(t *testing.T) {
+	// Path to the test torrent file
+	torrentPath := "../../internal/protocol/bt/testdata/ubuntu-22.04-live-server-amd64.iso.torrent"
+	if _, err := os.Stat(torrentPath); os.IsNotExist(err) {
+		t.Skip("Test torrent file not found, skipping test")
+	}
+
+	// Start a simple HTTP server to serve the torrent file
+	server := startTestTorrentServer(torrentPath)
+	defer server.Close()
+
+	// Create a temporary directory for the test
+	tempDir, err := os.MkdirTemp("", "auto_torrent_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create downloader
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		// Delete all tasks before clearing to avoid panic from BT tasks trying to access deleted resources
+		downloader.Delete(nil, true)
+		downloader.Clear()
+	}()
+
+	// Track created tasks
+	btTaskCreated := make(chan struct{}, 1)
+	var originalTaskId string
+
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyStart {
+			// A new task started - if it's not the original, it's the BT task
+			if event.Task != nil && event.Task.ID != originalTaskId && originalTaskId != "" {
+				select {
+				case btTaskCreated <- struct{}{}:
+				default:
+				}
+			}
+		}
+	})
+
+	// Create request to download the torrent file
+	req := &base.Request{
+		URL: "http://" + server.Addr().String() + "/ubuntu.torrent",
+	}
+
+	// Create task with AutoTorrent enabled
+	downloadDir := tempDir + "/downloads"
+	originalTaskId, err = downloader.CreateDirect(req, &base.Options{
+		Path: downloadDir,
+		Name: "ubuntu.torrent",
+		Extra: http.OptsExtra{
+			Connections: 1,
+			AutoTorrent: util.BoolPtr(true),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("Original task ID: %s", originalTaskId)
+
+	// Wait for BT task to be created (with timeout)
+	select {
+	case <-btTaskCreated:
+		t.Log("BT task created")
+	case <-time.After(10 * time.Second):
+		t.Log("Timeout waiting for BT task creation")
+	}
+
+	// Give a small buffer for task creation to complete
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify that a BT task was created
+	tasks := downloader.GetTasks()
+
+	// At minimum, we should have 2 tasks: the original torrent download and the BT task
+	if len(tasks) < 2 {
+		t.Errorf("Expected at least 2 tasks (torrent download + BT task), got %d", len(tasks))
+	} else {
+		t.Logf("Successfully created %d tasks", len(tasks))
+	}
+}
+
+// TestDownloader_AutoTorrentWithDelete tests the auto-torrent with DeleteTorrentAfterDownload option
+func TestDownloader_AutoTorrentWithDelete(t *testing.T) {
+	// Path to the test torrent file
+	torrentPath := "../../internal/protocol/bt/testdata/ubuntu-22.04-live-server-amd64.iso.torrent"
+	if _, err := os.Stat(torrentPath); os.IsNotExist(err) {
+		t.Skip("Test torrent file not found, skipping test")
+	}
+
+	// Start a simple HTTP server to serve the torrent file
+	server := startTestTorrentServer(torrentPath)
+	defer server.Close()
+
+	// Create a temporary directory for the test
+	tempDir, err := os.MkdirTemp("", "auto_torrent_delete_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create downloader
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		// Delete all tasks before clearing to avoid panic from BT tasks trying to access deleted resources
+		downloader.Delete(nil, true)
+		downloader.Clear()
+	}()
+
+	// Track task events
+	var originalTaskId string
+	originalTaskDeleted := make(chan struct{}, 1)
+	btTaskCreated := make(chan struct{}, 1)
+
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyStart {
+			// BT task was created and started
+			if event.Task != nil && event.Task.ID != originalTaskId && originalTaskId != "" {
+				select {
+				case btTaskCreated <- struct{}{}:
+				default:
+				}
+			}
+		}
+		if event.Key == EventKeyDelete {
+			// Check if the deleted task is the original torrent task
+			if event.Task != nil && event.Task.ID == originalTaskId {
+				select {
+				case originalTaskDeleted <- struct{}{}:
+				default:
+				}
+			}
+		}
+	})
+
+	// Create request to download the torrent file
+	req := &base.Request{
+		URL: "http://" + server.Addr().String() + "/ubuntu.torrent",
+	}
+
+	// Create task with AutoTorrent and DeleteTorrentAfterDownload enabled
+	downloadDir := tempDir + "/downloads"
+	originalTaskId, err = downloader.CreateDirect(req, &base.Options{
+		Path: downloadDir,
+		Name: "ubuntu.torrent",
+		Extra: http.OptsExtra{
+			Connections:                1,
+			AutoTorrent:                util.BoolPtr(true),
+			DeleteTorrentAfterDownload: util.BoolPtr(true),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("Original task ID: %s", originalTaskId)
+
+	// Wait for original task to be deleted (this happens after BT task is created)
+	select {
+	case <-originalTaskDeleted:
+		t.Log("Original torrent task was deleted as expected")
+	case <-time.After(10 * time.Second):
+		// Check manually if the task still exists
+		originalTask := downloader.GetTask(originalTaskId)
+		if originalTask != nil {
+			t.Error("Original torrent task should have been deleted but still exists")
+		} else {
+			t.Log("Original torrent task was deleted (detected via GetTask)")
+		}
+	}
+
+	// Give a moment for BT task creation
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify that original task is deleted and BT task exists
+	originalTask := downloader.GetTask(originalTaskId)
+	if originalTask != nil {
+		t.Error("Original torrent task should have been deleted")
+	}
+
+	// Verify remaining tasks (should have at least the BT task)
+	tasks := downloader.GetTasks()
+	t.Logf("Remaining tasks: %d", len(tasks))
+
+	// At least one task should remain (the BT task)
+	if len(tasks) == 0 {
+		t.Error("Expected at least one task (BT task) to remain")
+	}
+
+	// None of the remaining tasks should be the original torrent task
+	for _, task := range tasks {
+		if task.ID == originalTaskId {
+			t.Error("Original torrent task should have been deleted")
+		}
+	}
+}
+
+// TestDownloader_AutoTorrentDisabled tests that auto-torrent does not create BT task when disabled
+func TestDownloader_AutoTorrentDisabled(t *testing.T) {
+	// Path to the test torrent file
+	torrentPath := "../../internal/protocol/bt/testdata/ubuntu-22.04-live-server-amd64.iso.torrent"
+	if _, err := os.Stat(torrentPath); os.IsNotExist(err) {
+		t.Skip("Test torrent file not found, skipping test")
+	}
+
+	// Start a simple HTTP server to serve the torrent file
+	server := startTestTorrentServer(torrentPath)
+	defer server.Close()
+
+	// Create a temporary directory for the test
+	tempDir, err := os.MkdirTemp("", "auto_torrent_disabled_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create downloader
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		downloader.Delete(nil, true)
+		downloader.Clear()
+	}()
+
+	// Track task completion
+	taskDone := make(chan struct{}, 1)
+
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone {
+			select {
+			case taskDone <- struct{}{}:
+			default:
+			}
+		}
+	})
+
+	// Create request to download the torrent file
+	req := &base.Request{
+		URL: "http://" + server.Addr().String() + "/ubuntu.torrent",
+	}
+
+	// Create task with AutoTorrent explicitly disabled
+	downloadDir := tempDir + "/downloads"
+	_, err = downloader.CreateDirect(req, &base.Options{
+		Path: downloadDir,
+		Name: "ubuntu.torrent",
+		Extra: http.OptsExtra{
+			Connections: 1,
+			AutoTorrent: util.BoolPtr(false),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for task to complete
+	select {
+	case <-taskDone:
+		// Task completed
+	case <-time.After(10 * time.Second):
+		t.Fatal("Timeout waiting for task to complete")
+	}
+
+	// Give a small buffer
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify that only 1 task exists (no BT task was created)
+	tasks := downloader.GetTasks()
+	if len(tasks) != 1 {
+		t.Errorf("Expected exactly 1 task (torrent download only), got %d", len(tasks))
+	}
+
+	// Verify the torrent file was downloaded
+	torrentFilePath := downloadDir + "/ubuntu.torrent"
+	if _, err := os.Stat(torrentFilePath); os.IsNotExist(err) {
+		t.Error("Torrent file should have been downloaded")
+	}
+}
+
+func TestDownloader_PatchTask_HTTP(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	req := &base.Request{
+		URL: "http://" + listener.Addr().String() + "/" + test.BuildName,
+		Extra: &http.OptsExtra{
+			Connections: 2,
+		},
+		Labels: map[string]string{
+			"test": "value1",
+		},
+	}
+	opts := &base.Options{
+		Path: t.TempDir(),
+		Name: test.DownloadName,
+	}
+
+	// Create task but don't start it yet
+	taskId, err := downloader.CreateDirect(req, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pause the task immediately
+	if err := downloader.Pause(&TaskFilter{IDs: []string{taskId}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Patch the task with new labels
+	patchReq := &base.Request{
+		Labels: map[string]string{
+			"test":   "value2",
+			"newKey": "newValue",
+		},
+	}
+
+	if err := downloader.Patch(taskId, patchReq, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the patch was applied
+	task := downloader.GetTask(taskId)
+	if task == nil {
+		t.Fatal("task not found")
+	}
+
+	if task.Meta.Req.Labels["test"] != "value2" {
+		t.Errorf("PatchTask() label 'test' = %v, want %v", task.Meta.Req.Labels["test"], "value2")
+	}
+	if task.Meta.Req.Labels["newKey"] != "newValue" {
+		t.Errorf("PatchTask() label 'newKey' = %v, want %v", task.Meta.Req.Labels["newKey"], "newValue")
+	}
+
+	// Clean up
+	downloader.Delete(&TaskFilter{IDs: []string{taskId}}, true)
+}
+
+func TestDownloader_PatchTask_NotFound(t *testing.T) {
+	downloader := NewDownloader(nil)
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	// Try to patch a non-existent task
+	patchReq := &base.Request{
+		Labels: map[string]string{
+			"test": "value",
+		},
+	}
+
+	err := downloader.Patch("non-existent-id", patchReq, nil)
+	if err != ErrTaskNotFound {
+		t.Errorf("Patch() error = %v, want %v", err, ErrTaskNotFound)
+	}
+}
+
+func newTaskGroupDownloader(t *testing.T, storage Storage, maxRunning int) *Downloader {
+	t.Helper()
+	if storage == nil {
+		storage = NewMemStorage()
+	}
+	d := NewDownloader(&DownloaderConfig{Storage: storage, StorageDir: t.TempDir(), TempDir: t.TempDir(), FetchManagers: []fetcher.FetcherManager{&generationTestManager{holdOpen: true}}})
+	if err := d.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	d.cfg.MaxRunning = maxRunning
+	t.Cleanup(func() { d.Close() })
+	return d
+}
+
+func taskGroupBatch(root string, count int) *base.CreateTaskBatch {
+	batch := &base.CreateTaskBatch{Group: true, GroupName: "folder", Opts: &base.Options{Path: root}}
+	for i := 0; i < count; i++ {
+		batch.Reqs = append(batch.Reqs, &base.CreateTaskBatchItem{Req: &base.Request{URL: fmt.Sprintf("generation://file/%d", i)}})
+	}
+	return batch
+}
+
+func TestDownloader_TaskGroupMetadataAndRestore(t *testing.T) {
+	storageDir := t.TempDir()
+	d := newTaskGroupDownloader(t, NewBoltStorage(storageDir), 0)
+	root := t.TempDir()
+	result, err := d.CreateDirectBatchWithResult(taskGroupBatch(root, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ParentID == "" || len(result.TaskIDs) != 2 || d.groups[result.ParentID].Path != filepath.Join(root, "folder") {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if len(d.GetTasks()) != 2 || d.GetTask(result.ParentID) != nil {
+		t.Fatal("a group must not be a download task")
+	}
+	for _, id := range result.TaskIDs {
+		task := d.GetTask(id)
+		if task.ParentID != result.ParentID || task.group == nil || task.Meta.Opts.Path != d.groups[result.ParentID].Path || !task.Meta.Opts.SkipAutoCategorize {
+			t.Fatalf("incorrect member: %+v", task)
+		}
+		wire, err := json.Marshal(task)
+		if err != nil || !bytes.Contains(wire, []byte(`"group":`)) || bytes.Contains(wire, []byte(`"type":`)) {
+			t.Fatalf("invalid task query: %s, %v", wire, err)
+		}
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restored := newTaskGroupDownloader(t, NewBoltStorage(storageDir), 0)
+	for _, id := range result.TaskIDs {
+		task := restored.GetTask(id)
+		if task == nil || task.group == nil || task.group.Path != d.groups[result.ParentID].Path || task.group.Name != d.groups[result.ParentID].Name || task.ParentID != result.ParentID {
+			t.Fatalf("lost metadata on restore: %+v", task)
+		}
+	}
+	if err := restored.Delete(&TaskFilter{IDs: []string{result.ParentID, result.TaskIDs[0]}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(restored.GetTasks()) != 0 || len(restored.groups) != 0 {
+		t.Fatal("group deletion left records")
+	}
+}
+
+func TestDownloader_TaskGroupQueue(t *testing.T) {
+	for _, existing := range []int{0, 2} {
+		t.Run(fmt.Sprint(existing), func(t *testing.T) {
+			d := newTaskGroupDownloader(t, nil, 5)
+			for i := 0; i < existing; i++ {
+				if _, err := d.CreateDirect(&base.Request{URL: "generation://independent"}, &base.Options{Path: t.TempDir()}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := d.CreateDirectBatchWithResult(taskGroupBatch(t.TempDir(), 6))
+			if err != nil {
+				t.Fatal(err)
+			}
+			running, waiting := 0, 0
+			for _, id := range result.TaskIDs {
+				switch d.taskStatus(d.GetTask(id)) {
+				case base.DownloadStatusRunning:
+					running++
+				case base.DownloadStatusWait:
+					waiting++
+				}
+			}
+			if running != 5-existing || waiting != 1+existing {
+				t.Fatalf("group running=%d waiting=%d, existing=%d", running, waiting, existing)
+			}
+			if err := d.Pause(&TaskFilter{IDs: []string{result.ParentID, result.TaskIDs[0]}}); err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range result.TaskIDs {
+				if d.taskStatus(d.GetTask(id)) != base.DownloadStatusPause {
+					t.Fatal("group pause did not pause all members")
+				}
+			}
+			d.lock.Lock()
+			queued := len(d.waitTasks)
+			d.lock.Unlock()
+			if queued != 0 {
+				t.Fatal("paused group still has queued members")
+			}
+			if err := d.Continue(&TaskFilter{IDs: []string{result.ParentID, result.TaskIDs[0]}}); err != nil {
+				t.Fatal(err)
+			}
+			if len(d.expandGroupTaskIDs([]string{result.ParentID, result.TaskIDs[0]})) != 6 {
+				t.Fatal("mixed operation duplicates members")
+			}
+		})
+	}
+}
+
+type taskGroupTestStorage struct {
+	Storage
+	beforePut       func(*Task) error
+	failGroupPut    bool
+	failGroupDelete bool
+}
+
+func (s *taskGroupTestStorage) Put(bucket, key string, value any) error {
+	if bucket == bucketTaskGroup && s.failGroupPut {
+		return errors.New("group write failed")
+	}
+	if bucket == bucketTask && s.beforePut != nil {
+		if err := s.beforePut(value.(*Task)); err != nil {
+			return err
+		}
+	}
+	return s.Storage.Put(bucket, key, value)
+}
+func (s *taskGroupTestStorage) Delete(bucket, key string) error {
+	if bucket == bucketTaskGroup && s.failGroupDelete {
+		return errors.New("group delete failed")
+	}
+	return s.Storage.Delete(bucket, key)
+}
+
+func TestDownloader_TaskGroupPartialFailureAndFirstSave(t *testing.T) {
+	var saved []*Task
+	storage := &taskGroupTestStorage{Storage: NewMemStorage(), beforePut: func(task *Task) error {
+		saved = append(saved, task)
+		if task.Meta.Req.URL == "generation://bad" {
+			return errors.New("child write failed")
+		}
+		return nil
+	}}
+	d := newTaskGroupDownloader(t, storage, 0)
+	batch := taskGroupBatch(t.TempDir(), 3)
+	batch.Reqs[1].Req.URL = "generation://bad"
+	result, err := d.CreateDirectBatchWithResult(batch)
+	if err != nil || len(result.TaskIDs) != 2 {
+		t.Fatalf("unexpected partial result: %+v, %v", result, err)
+	}
+	for _, task := range saved {
+		if task.ParentID != result.ParentID {
+			t.Fatal("first save omitted parent ID")
+		}
+	}
+	if len(d.groups) != 1 || len(d.GetTasks()) != 2 {
+		t.Fatal("partial result lost successful members")
+	}
+	parent := t.TempDir()
+	batch = taskGroupBatch(parent, 1)
+	batch.Reqs[0].Req.URL = "generation://bad"
+	failed, err := d.CreateDirectBatchWithResult(batch)
+	if err == nil || failed != nil {
+		t.Fatalf("all failure result: %+v, %v", failed, err)
+	}
+	if len(d.groups) != 1 {
+		t.Fatal("all failed batch left empty group metadata")
+	}
+
+	if _, err := os.Stat(filepath.Join(parent, "folder")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("failed group directory retained")
+	}
+}
+
+func TestDownloader_TaskGroupDirectoryValidation(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	root := t.TempDir()
+	for _, name := range []string{"", " ", ".", "..", "../outside", "nested/folder", `nested\folder`, "/absolute", "a\x00b"} {
+		batch := taskGroupBatch(root, 1)
+		batch.GroupName = name
+		if _, err := d.CreateDirectBatchWithResult(batch); err == nil {
+			t.Fatalf("accepted invalid name %q", name)
+		}
+	}
+	first, err := d.CreateDirectBatchWithResult(taskGroupBatch(root, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := d.CreateDirectBatchWithResult(taskGroupBatch(root, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ParentID == second.ParentID || d.groups[second.ParentID].Name != "folder (1)" || d.groups[second.ParentID].Path != filepath.Join(root, "folder (1)") {
+		t.Fatalf("group identity/dedup failed: %+v", second)
+	}
+	batch := taskGroupBatch(root, 2)
+	batch.Reqs[0].Opts = &base.Options{Path: filepath.Join(root, "nested")}
+	batch.Reqs[1].Opts = &base.Options{Path: filepath.Dir(root)}
+	result, err := d.CreateDirectBatchWithResult(batch)
+	if err != nil || len(result.TaskIDs) != 1 {
+		t.Fatalf("path containment failed: %+v, %v", result, err)
+	}
+	if d.GetTask(result.TaskIDs[0]).Meta.Opts.Path != filepath.Join(d.groups[result.ParentID].Path, "nested") {
+		t.Fatal("nested member path was not rebased")
+	}
+	d.cfg.WhiteDownloadDirs = []string{root}
+	if _, err := d.CreateDirectBatchWithResult(taskGroupBatch(root, 1)); err == nil {
+		t.Fatal("group directory bypassed whitelist")
+	}
+}
+
+func TestDownloader_TaskGroupConcurrentNames(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	root := t.TempDir()
+	results := make(chan *CreateTaskBatchResult, 4)
+	errs := make(chan error, 4)
+	for range 4 {
+		go func() {
+			result, err := d.CreateDirectBatchWithResult(taskGroupBatch(root, 1))
+			results <- result
+			errs <- err
+		}()
+	}
+	ids, paths := map[string]bool{}, map[string]bool{}
+	for range 4 {
+		result := <-results
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		d.lock.Lock()
+		path := d.groups[result.ParentID].Path
+		d.lock.Unlock()
+		if ids[result.ParentID] || paths[path] {
+			t.Fatal("concurrent groups share identity/directory")
+		}
+		ids[result.ParentID] = true
+		paths[path] = true
+	}
+}
+
+func TestDownloader_TaskGroupStorageFailures(t *testing.T) {
+	storage := &taskGroupTestStorage{Storage: NewMemStorage(), failGroupPut: true}
+	d := newTaskGroupDownloader(t, storage, 0)
+	root := t.TempDir()
+	if _, err := d.CreateDirectBatchWithResult(taskGroupBatch(root, 1)); err == nil {
+		t.Fatal("group write failure ignored")
+	}
+	entries, _ := os.ReadDir(root)
+	if len(entries) != 0 {
+		t.Fatal("failed metadata write left reserved directory")
+	}
+	storage.failGroupPut = false
+	result, err := d.CreateDirectBatchWithResult(taskGroupBatch(root, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage.failGroupDelete = true
+	if err := d.Delete(&TaskFilter{IDs: result.TaskIDs}, false); err == nil {
+		t.Fatal("expected metadata delete failure")
+	}
+	if d.groups[result.ParentID] == nil {
+		t.Fatal("failed metadata deletion discarded retry state")
+	}
+	storage.failGroupDelete = false
+	if err := d.Delete(&TaskFilter{IDs: []string{result.ParentID}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.groups) != 0 {
+		t.Fatal("metadata deletion retry failed")
+	}
+}
+
+func TestDownloader_TaskGroupResponseCompatibility(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	for _, grouped := range []bool{false, true} {
+		batch := taskGroupBatch(t.TempDir(), 1)
+		batch.Group = grouped
+		result, err := d.CreateDirectBatchWithResult(batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(wire, &fields); err != nil {
+			t.Fatalf("batch must return object: %s", wire)
+		}
+		want := 1
+		if grouped {
+			want = 2
+		}
+		if len(fields) != want || fields["taskIds"] == nil || (grouped && fields["parentId"] == nil) {
+			t.Fatalf("unexpected response: %s", wire)
+		}
+		if grouped {
+			d.lock.Lock()
+			delete(d.groups, result.ParentID)
+			d.lock.Unlock()
+			if got := d.expandGroupTaskIDs([]string{result.ParentID}); !reflect.DeepEqual(got, result.TaskIDs) {
+				t.Fatalf("membership lost: %v", got)
+			}
+		}
+	}
+}
+
+type groupFailureDeleteStorage struct{ Storage }
+
+func (s *groupFailureDeleteStorage) Delete(bucket, key string) error {
+	if bucket == bucketSave {
+		return errors.New("save delete failed")
+	}
+	return s.Storage.Delete(bucket, key)
+}
+func TestDownloader_TaskGroupDeletePersistence(t *testing.T) {
+	storage := &groupFailureDeleteStorage{Storage: NewMemStorage()}
+	d := newTaskGroupDownloader(t, storage, 0)
+	result, err := d.CreateDirectBatchWithResult(taskGroupBatch(t.TempDir(), 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Delete(&TaskFilter{IDs: result.TaskIDs}, false); err == nil {
+		t.Fatal("expected failure")
+	}
+	if d.GetTask(result.TaskIDs[0]) == nil {
+		t.Fatal("missing live task")
+	}
+	var saved Task
+	exists, err := storage.Get(bucketTask, result.TaskIDs[0], &saved)
+	if err != nil || !exists {
+		t.Fatalf("retained member is absent from durable storage: exists=%v err=%v", exists, err)
+	}
+}
+
+type groupFailureConcurrentDeleteStorage struct {
+	Storage
+	blockedID string
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (s *groupFailureConcurrentDeleteStorage) Delete(bucket, key string) error {
+	if bucket == bucketTask && key == s.blockedID {
+		close(s.entered)
+		<-s.release
+		return errors.New("member delete failed")
+	}
+	return s.Storage.Delete(bucket, key)
+}
+func TestDownloader_TaskGroupConcurrentDelete(t *testing.T) {
+	storage := &groupFailureConcurrentDeleteStorage{Storage: NewMemStorage(), entered: make(chan struct{}), release: make(chan struct{})}
+	d := newTaskGroupDownloader(t, storage, 0)
+	result, err := d.CreateDirectBatchWithResult(taskGroupBatch(t.TempDir(), 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage.blockedID = result.TaskIDs[0]
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- d.Delete(&TaskFilter{IDs: []string{result.TaskIDs[0]}}, false) }()
+	<-storage.entered
+	if err := d.Delete(&TaskFilter{IDs: []string{result.TaskIDs[1]}}, false); err != nil {
+		t.Fatal(err)
+	}
+	close(storage.release)
+	if err := <-firstDone; err == nil {
+		t.Fatal("expected member deletion failure")
+	}
+	if d.GetTask(result.TaskIDs[0]) == nil {
+		t.Fatal("missing retained member")
+	}
+	if d.groups[result.ParentID] == nil {
+		t.Fatal("concurrent cleanup removed group metadata of a failed member")
+	}
+}
+
+func TestDownloader_TaskGroupForceRetryPathReuse(t *testing.T) {
+	storage := &taskGroupTestStorage{Storage: NewMemStorage()}
+	d := newTaskGroupDownloader(t, storage, 0)
+	root := t.TempDir()
+	first, err := d.CreateDirectBatchWithResult(taskGroupBatch(root, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage.failGroupDelete = true
+	_ = d.Delete(&TaskFilter{IDs: []string{first.ParentID}}, true)
+	storage.failGroupDelete = false
+	second, err := d.CreateDirectBatchWithResult(taskGroupBatch(root, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.groups[first.ParentID].Path == d.groups[second.ParentID].Path {
+		t.Fatal("reserved metadata path was reused")
+	}
+	marker := filepath.Join(d.groups[second.ParentID].Path, "second-group.txt")
+	if err := os.WriteFile(marker, []byte("retain"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Delete(&TaskFilter{IDs: []string{first.ParentID}}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("old group cleanup deleted new group file", err)
+	}
+}
+
+func TestDownloader_TaskGroupPlaceholderPath(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	result, err := d.CreateDirectBatchWithResult(taskGroupBatch(filepath.Join(t.TempDir(), "%year%"), 1))
+	if err != nil || len(result.TaskIDs) != 1 {
+		t.Fatalf("placeholder path rejected: %+v, %v", result, err)
+	}
+}
+func TestDownloader_TaskGroupDefaultNestedPath(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	d.cfg.DownloadDir = t.TempDir()
+	batch := taskGroupBatch("", 1)
+	batch.Reqs[0].Opts = &base.Options{Path: "nested"}
+	result, err := d.CreateDirectBatchWithResult(batch)
+	if err != nil || len(result.TaskIDs) != 1 {
+		t.Fatalf("default nested path rejected: %+v, %v", result, err)
+	}
+	if d.GetTask(result.TaskIDs[0]).Meta.Opts.Path != filepath.Join(d.groups[result.ParentID].Path, "nested") {
+		t.Fatal("default nested path lost")
+	}
+}
+
+func TestDownloader_TaskGroupDeleteFailureRestoresQueue(t *testing.T) {
+	storage := &groupFailureConcurrentDeleteStorage{Storage: NewMemStorage(), entered: make(chan struct{}), release: make(chan struct{})}
+	d := newTaskGroupDownloader(t, storage, 1)
+	result, err := d.CreateDirectBatchWithResult(taskGroupBatch(t.TempDir(), 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage.blockedID = result.TaskIDs[1]
+	close(storage.release)
+	if err := d.Delete(&TaskFilter{IDs: []string{storage.blockedID}}, false); err == nil {
+		t.Fatal("expected deletion failure")
+	}
+	d.lock.Lock()
+	queued := len(d.waitTasks)
+	d.lock.Unlock()
+	if queued != 1 {
+		t.Fatal("failed deletion lost queued member")
+	}
+	if err := d.Delete(&TaskFilter{IDs: []string{result.TaskIDs[0]}}, false); err != nil {
+		t.Fatal(err)
+	}
+	waitForTaskStatus(t, d, storage.blockedID, base.DownloadStatusRunning, time.Second)
+}
+
+func TestDownloader_ResolvedCreateFailureRetainsResourceID(t *testing.T) {
+	fail := true
+	storage := &taskGroupTestStorage{Storage: NewMemStorage(), beforePut: func(*Task) error {
+		if fail {
+			return errors.New("task write failed")
+		}
+		return nil
+	}}
+	d := newTaskGroupDownloader(t, storage, 0)
+	resolved, err := d.Resolve(&base.Request{URL: "generation://resolved"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, err := d.CreateWithOptions(resolved.ID, &base.Options{Path: t.TempDir()}); id != "" || err == nil {
+		t.Fatalf("expected save failure: %s %v", id, err)
+	}
+	fail = false
+	if id, err := d.CreateWithOptions(resolved.ID, &base.Options{Path: t.TempDir()}); id == "" || err != nil {
+		t.Fatalf("resolved retry failed: %s %v", id, err)
+	}
+}
+
+func TestDownloader_TaskGroupExtensionBatchRestore(t *testing.T) {
+	payload := []byte("folder download")
+	url := startCategoryFileServer(t, "original.bin", payload)
+	storageDir := t.TempDir()
+	parentDir := t.TempDir()
+	output := filepath.Join(parentDir, "folder")
+	d := NewDownloader(&DownloaderConfig{Storage: NewBoltStorage(storageDir), StorageDir: t.TempDir(), TempDir: t.TempDir()})
+	if err := d.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { d.Close() }()
+	defaultDir := t.TempDir()
+	categoryDir := putCategoryConfig(t, d, defaultDir, true, []string{"txt", "mp4"})
+	cfg, err := d.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxRunning = 0
+	if err := d.PutConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	extDir := t.TempDir()
+	manifest := `{"name":"task-group","author":"test","title":"Task group","version":"1.0.0","scripts":[{"event":"onResolve","match":{"urls":["https://example.com/folder"]},"entry":"index.js"}]}`
+	script := fmt.Sprintf(`gopeed.events.onResolve(ctx => {
+  ctx.res = {name: 'folder', files: [
+    {name: 'report.txt', path: '', size: %d, req: {url: %q}},
+    {name: 'movie.mp4', path: 'nested', size: %d, req: {url: %q}}
+  ]};
+});`, len(payload), url, len(payload), url)
+	for name, content := range map[string]string{"manifest.json": manifest, "index.js": script} {
+		if err := os.WriteFile(filepath.Join(extDir, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.InstallExtensionByFolder(extDir, true); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := d.Resolve(&base.Request{URL: "https://example.com/folder"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ID != "" || len(resolved.Res.Files) != 2 {
+		t.Fatalf("expected extension files for batch creation, got %+v", resolved)
+	}
+	batch := &base.CreateTaskBatch{Group: true, GroupName: resolved.Res.Name, Opts: &base.Options{Path: parentDir}}
+	for _, file := range resolved.Res.Files {
+		batch.Reqs = append(batch.Reqs, &base.CreateTaskBatchItem{
+			Req: file.Req,
+			Opts: &base.Options{
+				Name: file.Name, Path: filepath.Join(parentDir, file.Path), Size: file.Size,
+				SkipAutoCategorize: true,
+			},
+		})
+	}
+	result, err := d.CreateDirectBatchWithResult(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := result.TaskIDs
+	if len(ids) != len(batch.Reqs) {
+		t.Fatalf("child count = %d, want %d", len(ids), len(batch.Reqs))
+	}
+	for _, id := range ids {
+		status, err := d.RuntimeStatus(id)
+		if err != nil || status.Status != base.DownloadStatusWait || status.Total != int64(len(payload)) {
+			t.Fatalf("queued child status = %+v, error = %v", status, err)
+		}
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d = NewDownloader(&DownloaderConfig{Storage: NewBoltStorage(storageDir), StorageDir: t.TempDir(), TempDir: t.TempDir()})
+	if err := d.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	group := d.groups[result.ParentID]
+	if group == nil || group.Name != "folder" || group.Path != output {
+		t.Fatalf("group did not survive restart: %+v", group)
+	}
+	for i, id := range ids {
+		child := d.GetTask(id)
+		opts := batch.Reqs[i].Opts
+		if child == nil || child.ParentID != group.ID || child.Meta.Opts.Path != filepath.Join(output, resolved.Res.Files[i].Path) || child.Meta.Opts.Name != opts.Name || child.Meta.Opts.Size != opts.Size {
+			t.Fatalf("child options or membership lost after restart: %+v", child)
+		}
+	}
+	cfg, err = d.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxRunning = 1
+	if err := d.PutConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *Event, len(ids))
+	d.Listener(func(event *Event) {
+		if event.Key == EventKeyDone || event.Key == EventKeyError {
+			done <- event
+		}
+	})
+	if err := d.Continue(&TaskFilter{IDs: []string{group.ID}}); err != nil {
+		t.Fatal(err)
+	}
+	for range ids {
+		select {
+		case event := <-done:
+			if event.Key != EventKeyDone {
+				t.Fatalf("child download failed: %v", event.Err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("group members did not finish with one download slot")
+		}
+	}
+	for i, item := range batch.Reqs {
+		path := filepath.Join(output, resolved.Res.Files[i].Path, item.Opts.Name)
+		content, err := os.ReadFile(path)
+		if err != nil || string(content) != string(payload) {
+			t.Fatalf("downloaded file %s = %q, error = %v", path, content, err)
+		}
+	}
+	if _, err := os.Stat(categoryDir); !os.IsNotExist(err) {
+		t.Fatalf("explicit folder download was categorized: %v", err)
+	}
+	cfg, err = d.GetConfig()
+	if err != nil || cfg.DownloadDir != defaultDir {
+		t.Fatalf("folder download changed the default directory: %+v, error = %v", cfg, err)
+	}
+}
+
+func TestDownloader_TaskGroupSeparateBatchCreatesSeparateGroups(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	parent := t.TempDir()
+	first, err := d.CreateDirectBatchWithResult(taskGroupBatch(parent, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBatch := taskGroupBatch(parent, 1)
+	secondBatch.Reqs[0].Req.URL = "generation://retry"
+	second, err := d.CreateDirectBatchWithResult(secondBatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ParentID == second.ParentID || d.groups[first.ParentID].Path == d.groups[second.ParentID].Path {
+		t.Fatalf("separate batch calls shared a group: first=%+v second=%+v", first, second)
+	}
+	if d.GetTask(second.TaskIDs[0]).ParentID != second.ParentID {
+		t.Fatal("second batch member has wrong group")
+	}
+}
+
+func TestDownloader_TaskGroupRejectsEmptyParentAndWindowsNames(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	d.cfg.DownloadDir = ""
+	if _, err := d.CreateDirectBatchWithResult(taskGroupBatch("", 1)); err == nil {
+		t.Fatal("empty parent accepted")
+	}
+	for _, name := range []string{"bad:name", "bad*name", "bad?name", "bad.", "bad<name>"} {
+		batch := taskGroupBatch(t.TempDir(), 1)
+		batch.GroupName = name
+		if _, err := d.CreateDirectBatchWithResult(batch); err == nil {
+			t.Fatalf("invalid group name accepted: %q", name)
+		}
+	}
+}
+
+func TestDownloader_TaskGroupNestedWhitelist(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		restart bool
+		revoke  bool
+	}{
+		{name: "pause and resume"},
+		{name: "restart and resume", restart: true},
+		{name: "pause and revoke permission", revoke: true},
+		{name: "restart and revoke permission", restart: true, revoke: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			storageDir := t.TempDir()
+			d := newTaskGroupDownloader(t, NewBoltStorage(storageDir), 1)
+			root := t.TempDir()
+			d.cfg.WhiteDownloadDirs = []string{filepath.Join(root, "*")}
+			events := make(chan EventKey, 2)
+			listener := func(event *Event) {
+				if event.Key == EventKeyStart || event.Key == EventKeyError {
+					events <- event.Key
+				}
+			}
+			d.Listener(listener)
+			batch := taskGroupBatch(root, 1)
+			batch.Reqs[0].Opts = &base.Options{Path: "nested"}
+			result, err := d.CreateDirectBatchWithResult(batch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case event := <-events:
+				if event != EventKeyStart {
+					t.Fatalf("initial start failed: %s", event)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("initial member did not start")
+			}
+			if err := d.Pause(&TaskFilter{IDs: []string{result.ParentID}}); err != nil {
+				t.Fatal(err)
+			}
+			if test.restart {
+				if err := d.Close(); err != nil {
+					t.Fatal(err)
+				}
+				d = newTaskGroupDownloader(t, NewBoltStorage(storageDir), 1)
+				d.cfg.WhiteDownloadDirs = []string{filepath.Join(root, "*")}
+				d.Listener(listener)
+			}
+			task := d.GetTask(result.TaskIDs[0])
+			wantPath := filepath.Join(root, "folder", "nested")
+			if task.NeedsPreparation || task.group == nil || task.Meta.Opts.Path != wantPath {
+				t.Fatalf("prepared group member was not preserved: %+v", task)
+			}
+			if test.revoke {
+				d.cfg.WhiteDownloadDirs = []string{filepath.Join(t.TempDir(), "*")}
+			}
+			if err := d.Continue(&TaskFilter{IDs: []string{result.ParentID}}); err != nil {
+				t.Fatal(err)
+			}
+			wantEvent := EventKey(EventKeyStart)
+			if test.revoke {
+				wantEvent = EventKeyError
+			}
+			select {
+			case event := <-events:
+				if event != wantEvent {
+					t.Fatalf("resume event = %s, want %s", event, wantEvent)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("member did not finish starting")
+			}
+		})
+	}
+}
+
+func TestDownloader_CreateDirectBatchSignatureCompatibility(t *testing.T) {
+	var createBatch func(*Downloader, *base.CreateTaskBatch) ([]string, error) = (*Downloader).CreateDirectBatch
+	d := newTaskGroupDownloader(t, nil, 0)
+	if createBatch == nil {
+		t.Fatal("CreateDirectBatch compatibility method is nil")
+	}
+	ids, err := createBatch(d, &base.CreateTaskBatch{})
+	if err == nil || ids != nil {
+		t.Fatalf("empty batch result = %v, %v; want nil IDs and an error", ids, err)
+	}
+}
+
+func TestDownloader_TaskGroupNamePlaceholderIsStable(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	parent := t.TempDir()
+	batch := taskGroupBatch(parent, 1)
+	batch.GroupName = "album-%year%"
+	result, err := d.CreateDirectBatchWithResult(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(parent, "album-%year%")
+	task := d.GetTask(result.TaskIDs[0])
+	if err := task.fetcher.Resolve(task.Meta.Req); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.prepareTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if d.groups[result.ParentID].Path != want || task.Meta.Opts.Path != want {
+		t.Fatalf("reserved=%q task=%q want=%q", d.groups[result.ParentID].Path, task.Meta.Opts.Path, want)
+	}
+}
+
+func TestDownloader_BatchMixedResolvedAndDirect(t *testing.T) {
+	for _, grouped := range []bool{false, true} {
+		t.Run(fmt.Sprint(grouped), func(t *testing.T) {
+			storage := &taskGroupTestStorage{Storage: NewMemStorage()}
+			d := newTaskGroupDownloader(t, storage, 0)
+			rr, err := d.Resolve(&base.Request{URL: "generation://resolved"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A resolved multi-file resource must retain original selection indexes.
+			d.fetcherCache[rr.ID].Meta().Res = &base.Resource{Name: "bt-folder", Files: []*base.FileInfo{{Name: "a", Size: 1}, {Name: "b", Size: 2}}}
+			savedParents := []string{}
+			storage.beforePut = func(task *Task) error { savedParents = append(savedParents, task.ParentID); return nil }
+			batch := &base.CreateTaskBatch{Group: grouped, GroupName: "folder", Opts: &base.Options{Path: t.TempDir()}, Reqs: []*base.CreateTaskBatchItem{
+				{Rid: "missing"}, {Rid: rr.ID, Req: &base.Request{URL: "unsupported://ignored"}, Opts: &base.Options{SelectFiles: []int{1}}},
+				{Req: &base.Request{URL: "generation://direct"}}, {},
+			}}
+			result, err := d.CreateDirectBatchWithResult(batch)
+			if err != nil || len(result.TaskIDs) != 2 {
+				t.Fatalf("mixed result=%+v err=%v", result, err)
+			}
+			if grouped && result.ParentID == "" {
+				t.Fatal("missing parent")
+			}
+			for _, parent := range savedParents {
+				if parent != result.ParentID {
+					t.Fatal("membership missing in first save")
+				}
+			}
+			task := d.GetTask(result.TaskIDs[0])
+			if !reflect.DeepEqual(task.Meta.Opts.SelectFiles, []int{1}) {
+				t.Fatal("lost selection")
+			}
+			if _, ok := d.fetcherCache[rr.ID]; ok {
+				t.Fatal("successful rid not consumed")
+			}
+			if _, err := d.CreateDirectBatchWithResult(batch); err != nil {
+				t.Fatal("valid req after consumed rid must still be visited", err)
+			}
+		})
+	}
+}
+
+func TestDownloader_BatchAllFailedAndResolvedSelection(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	rr, err := d.Resolve(&base.Request{URL: "generation://resolved"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, grouped := range []bool{false, true} {
+		parent := t.TempDir()
+		result, err := d.CreateDirectBatchWithResult(&base.CreateTaskBatch{Group: grouped, GroupName: "failed", Opts: &base.Options{Path: parent}, Reqs: []*base.CreateTaskBatchItem{
+			{Rid: rr.ID, Opts: &base.Options{SelectFiles: []int{9}}}, {Req: &base.Request{URL: "unsupported://bad"}}, {},
+		}})
+		if err == nil || result != nil {
+			t.Fatalf("all-failed result=%+v err=%v", result, err)
+		}
+		if _, ok := d.fetcherCache[rr.ID]; !ok {
+			t.Fatal("failed selection consumed rid")
+		}
+		if len(d.groups) != 0 {
+			t.Fatal("empty groups retained")
+		}
+		entries, err := os.ReadDir(parent)
+		if err != nil || len(entries) != 0 {
+			t.Fatal("reserved directory retained")
+		}
+	}
+}
+
+func TestDownloader_BatchStartFailureKeepsCreatedTasks(t *testing.T) {
+	for _, grouped := range []bool{false, true} {
+		t.Run(fmt.Sprint(grouped), func(t *testing.T) {
+			d := newTaskGroupDownloader(t, nil, 2)
+			manager := d.cfg.FetchManagers[0].(*generationTestManager)
+			manager.resolveErr = errors.New("download preparation failed")
+			batch := taskGroupBatch(t.TempDir(), 2)
+			batch.Group = grouped
+			result, err := d.CreateDirectBatchWithResult(batch)
+			if err != nil || len(result.TaskIDs) != 2 {
+				t.Fatalf("persisted tasks must count as success: %+v, %v", result, err)
+			}
+			for _, id := range result.TaskIDs {
+				waitForTaskStatus(t, d, id, base.DownloadStatusError, time.Second)
+				if d.GetTask(id).ParentID != result.ParentID {
+					t.Fatal("failed task lost group membership")
+				}
+			}
+			if len(d.GetTasks()) != 2 {
+				t.Fatal("failed starts rolled back persisted tasks")
+			}
+		})
+	}
+}
+
+// The first Patch blocks after the resolved fetcher has received creation options.
+type resolvedCreateTestManager struct{ generationTestManager }
+
+func (*resolvedCreateTestManager) Name() string { return "http" }
+
+type resolvedCreateTestFetcher struct {
+	fetcher.Fetcher
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (f *resolvedCreateTestFetcher) Patch(*base.Request, *base.Options) error {
+	if f.calls.Add(1) == 1 {
+		close(f.entered)
+		<-f.release
+	}
+	return nil
+}
+
+func TestDownloader_ConcurrentResolvedCreation(t *testing.T) {
+	for _, modes := range []struct{ firstGroup, secondGroup bool }{{true, true}, {true, false}, {false, true}, {false, false}} {
+		t.Run(fmt.Sprintf("group=%t/competing-group=%t", modes.firstGroup, modes.secondGroup), func(t *testing.T) {
+			d := NewDownloader(&DownloaderConfig{StorageDir: t.TempDir(), TempDir: t.TempDir(), FetchManagers: []fetcher.FetcherManager{&resolvedCreateTestManager{}}})
+			if err := d.Setup(); err != nil {
+				t.Fatal(err)
+			}
+			d.cfg.MaxRunning = 0
+			t.Cleanup(func() { d.Close() })
+			resolved, err := d.Resolve(&base.Request{URL: "generation://shared"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			gate := &resolvedCreateTestFetcher{Fetcher: d.fetcherCache[resolved.ID], entered: make(chan struct{}), release: make(chan struct{})}
+			gate.Meta().Res = &base.Resource{Files: []*base.FileInfo{{Name: "a", Size: 1}, {Name: "b", Size: 2}}}
+			d.fetcherCache[resolved.ID] = gate
+			release := sync.OnceFunc(func() { close(gate.release) })
+			t.Cleanup(release)
+			other, err := d.Resolve(&base.Request{URL: "generation://other"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			create := func(grouped bool, name string) (string, error) {
+				opts := &base.Options{Path: root, Size: 1, SelectFiles: []int{1}}
+				if !grouped {
+					return d.CreateWithOptions(resolved.ID, opts)
+				}
+				result, err := d.CreateDirectBatchWithResult(&base.CreateTaskBatch{Group: true, GroupName: name, Opts: &base.Options{Path: root}, Reqs: []*base.CreateTaskBatchItem{{Rid: resolved.ID, Opts: opts}}})
+				if err != nil {
+					return "", err
+				}
+				return result.TaskIDs[0], nil
+			}
+			type outcome struct {
+				id  string
+				err error
+			}
+			firstDone, secondDone := make(chan outcome, 1), make(chan outcome, 1)
+			go func() { id, err := create(modes.firstGroup, "first"); firstDone <- outcome{id, err} }()
+			select {
+			case <-gate.entered:
+			case <-time.After(3 * time.Second):
+				t.Fatal("first creation did not reach Patch")
+			}
+			go func() { id, err := create(modes.secondGroup, "second"); secondDone <- outcome{id, err} }()
+			select {
+			case second := <-secondDone:
+				if second.id != "" || second.err == nil {
+					t.Errorf("same rid was consumed twice: %+v", second)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("competing creation did not reject an occupied rid")
+			}
+			// Occupying one rid must not block an unrelated resolved resource.
+			if _, err := d.CreateWithOptions(other.ID, &base.Options{Path: root}); err != nil {
+				t.Fatal(err)
+			}
+			release()
+			var first outcome
+			select {
+			case first = <-firstDone:
+			case <-time.After(3 * time.Second):
+				t.Fatal("first creation did not finish")
+			}
+			if first.err != nil || first.id == "" {
+				t.Fatalf("first creation failed: %+v", first)
+			}
+			if len(d.GetTasks()) != 2 {
+				t.Fatalf("created %d tasks; want one per rid", len(d.GetTasks()))
+			}
+			task := d.GetTask(first.id)
+			wantPath := root
+			if modes.firstGroup {
+				wantPath = filepath.Join(root, "first")
+			}
+			if task.Meta.Opts.Path != wantPath || !reflect.DeepEqual(task.Meta.Opts.SelectFiles, []int{1}) {
+				t.Fatalf("creation options changed: %+v", task.Meta.Opts)
+			}
+			if _, err := d.CreateWithOptions(resolved.ID, nil); err == nil {
+				t.Fatal("created rid is still available")
+			}
+			if modes.secondGroup {
+				if _, err := os.Stat(filepath.Join(root, "second")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("rejected creation retained its directory: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestDownloader_ResolvedBatchSaveFailureRetainsResourceID(t *testing.T) {
+	for _, grouped := range []bool{false, true} {
+		t.Run(fmt.Sprint(grouped), func(t *testing.T) {
+			fail := true
+			storage := &taskGroupTestStorage{Storage: NewMemStorage(), beforePut: func(*Task) error {
+				if fail {
+					return errors.New("save failed")
+				}
+				return nil
+			}}
+			d := newTaskGroupDownloader(t, storage, 0)
+			resolved, err := d.Resolve(&base.Request{URL: "generation://retry"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.fetcherCache[resolved.ID].Meta().Res = &base.Resource{Files: []*base.FileInfo{{Name: "a", Size: 1}, {Name: "b", Size: 2}}}
+			batch := &base.CreateTaskBatch{Group: grouped, GroupName: "folder", Opts: &base.Options{Path: t.TempDir()}, Reqs: []*base.CreateTaskBatchItem{{Rid: resolved.ID, Opts: &base.Options{SelectFiles: []int{1}}}}}
+			if result, err := d.CreateDirectBatchWithResult(batch); err == nil || result != nil {
+				t.Fatalf("expected save failure: %+v, %v", result, err)
+			}
+			fail = false
+			result, err := d.CreateDirectBatchWithResult(batch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			task := d.GetTask(result.TaskIDs[0])
+			if !reflect.DeepEqual(task.Meta.Opts.SelectFiles, []int{1}) || task.ParentID != result.ParentID {
+				t.Fatalf("retry lost creation options: %+v", task)
+			}
+			if _, err := d.CreateDirectBatchWithResult(batch); err == nil {
+				t.Fatal("successful retry did not consume rid")
+			}
+		})
+	}
+}
+
+func TestDownloader_TaskGroupRelativeMemberPath(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	root := t.TempDir()
+	batch := taskGroupBatch(root, 1)
+	batch.Reqs[0].Opts = &base.Options{Path: "nested"}
+	result, err := d.CreateDirectBatchWithResult(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := d.GetTask(result.TaskIDs[0]).Meta.Opts.Path, filepath.Join(d.groups[result.ParentID].Path, "nested"); got != want {
+		t.Fatalf("member path=%q want=%q", got, want)
+	}
+}
+
+func TestDownloader_TaskGroupRelativeParentPath(t *testing.T) {
+	d := newTaskGroupDownloader(t, nil, 0)
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := taskGroupBatch(relative, 1)
+	result, err := d.CreateDirectBatchWithResult(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task := d.GetTask(result.TaskIDs[0]); task.Meta.Opts.Path != d.groups[result.ParentID].Path {
+		t.Fatalf("inherited parent path was appended again: %q", task.Meta.Opts.Path)
+	}
+}
+
+func TestDownloader_TaskGroupMemberPathOptions(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, parent := range []string{"downloads", "./downloads", filepath.Join(t.TempDir(), "downloads")} {
+		t.Run(parent, func(t *testing.T) {
+			absoluteParent, err := filepath.Abs(parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, test := range []struct {
+				name     string
+				opts     *base.Options
+				relative string
+			}{
+				{name: "inherited"},
+				{name: "empty", opts: &base.Options{}},
+				{name: "relative nested", opts: &base.Options{Path: "nested"}, relative: "nested"},
+				{name: "same name as parent", opts: &base.Options{Path: "downloads"}, relative: "downloads"},
+				{name: "absolute parent", opts: &base.Options{Path: absoluteParent}},
+				{name: "absolute nested", opts: &base.Options{Path: filepath.Join(absoluteParent, "nested")}, relative: "nested"},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					d := newTaskGroupDownloader(t, nil, 0)
+					batch := taskGroupBatch(parent, 1)
+					batch.Reqs[0].Opts = test.opts
+					result, err := d.CreateDirectBatchWithResult(batch)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got := d.GetTask(result.TaskIDs[0]).Meta.Opts.Path
+					want := filepath.Join(d.groups[result.ParentID].Path, test.relative)
+					if got != want {
+						t.Fatalf("member path=%q want=%q", got, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestDownloader_ResolvedBatchPreparationFailureConsumesResourceID(t *testing.T) {
+	for _, grouped := range []bool{false, true} {
+		t.Run(fmt.Sprint(grouped), func(t *testing.T) {
+			storage := &taskGroupTestStorage{Storage: NewMemStorage(), beforePut: func(task *Task) error {
+				if !task.NeedsPreparation {
+					return errors.New("preparation save failed")
+				}
+				return nil
+			}}
+			d := newTaskGroupDownloader(t, storage, 1)
+			resolved, err := d.Resolve(&base.Request{URL: "generation://start-failure"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := d.CreateDirectBatchWithResult(&base.CreateTaskBatch{Group: grouped, GroupName: "folder", Opts: &base.Options{Path: t.TempDir()}, Reqs: []*base.CreateTaskBatchItem{{Rid: resolved.ID}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitForTaskStatus(t, d, result.TaskIDs[0], base.DownloadStatusError, time.Second)
+			if _, err := d.CreateWithOptions(resolved.ID, nil); err == nil {
+				t.Fatal("download error made a persisted rid available again")
+			}
+			if len(d.GetTasks()) != 1 {
+				t.Fatal("download error caused recreation")
+			}
+		})
+	}
+}

@@ -1,0 +1,80 @@
+package cmd
+
+import (
+	_ "embed"
+	"fmt"
+	"github.com/GopeedLab/gopeed/pkg/base"
+	"github.com/GopeedLab/gopeed/pkg/rest"
+	"github.com/GopeedLab/gopeed/pkg/rest/model"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+)
+
+//go:embed banner.txt
+var banner string
+
+func Start(cfg *model.StartConfig) error {
+	srv, listener, err := rest.BuildServer(cfg)
+	if err != nil {
+		return err
+	}
+	fmt.Println(banner)
+	downloadCfg, err := rest.Downloader.GetConfig()
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	if rest.Downloader.IsFirstLoad() {
+		// Set default download config
+		if cfg.DownloadConfig != nil {
+			cfg.DownloadConfig.Merge(downloadCfg)
+			// TODO Use PatchConfig
+			rest.Downloader.PutConfig(cfg.DownloadConfig)
+			downloadCfg = cfg.DownloadConfig
+		}
+
+		downloadDir := downloadCfg.DownloadDir
+		// Set default download dir, in docker, it will be ${exe}/Downloads, else it will be ${user}/Downloads
+		if downloadDir == "" {
+			if base.InDocker == "true" {
+				downloadDir = filepath.Join(filepath.Dir(cfg.StorageDir), "Downloads")
+			} else {
+				userDir, err := os.UserHomeDir()
+				if err == nil {
+					downloadDir = filepath.Join(userDir, "Downloads")
+				}
+			}
+			if downloadDir != "" {
+				downloadCfg.DownloadDir = downloadDir
+				rest.Downloader.PutConfig(downloadCfg)
+			}
+		}
+
+		// The default download dir is resolved only after the core starts, so
+		// seed the built-in categories now that the dir is known. Init is
+		// idempotent and leaves an existing category list untouched.
+		downloadCfg.Init()
+		rest.Downloader.PutConfig(downloadCfg)
+	}
+	watchExit()
+
+	fmt.Printf("Server start success on http://%s\n", listener.Addr().String())
+	if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+func watchExit() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigs
+		fmt.Printf("Server is shutting down due to signal: %s\n", sig)
+		rest.Downloader.Close()
+		os.Exit(0)
+	}()
+}

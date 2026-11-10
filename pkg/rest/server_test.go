@@ -1,0 +1,1388 @@
+package rest
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"github.com/GopeedLab/gopeed/internal/test"
+	"github.com/GopeedLab/gopeed/pkg/base"
+	"github.com/GopeedLab/gopeed/pkg/download"
+	enginewebview "github.com/GopeedLab/gopeed/pkg/download/engine/webview"
+	"github.com/GopeedLab/gopeed/pkg/rest/model"
+)
+
+var (
+	restPort int
+
+	taskReq = &base.Request{
+		Extra: map[string]any{
+			"method": "",
+			"header": map[string]string{
+				"Usr-Agent": "gopeed",
+			},
+			"body": "",
+		},
+	}
+	taskRes = &base.Resource{
+		Size:  test.BuildSize,
+		Range: true,
+		Files: []*base.FileInfo{
+			{
+				Name: test.BuildName,
+				Path: "",
+				Size: test.BuildSize,
+			},
+		},
+	}
+	createOpts = &base.Options{
+		Path: test.Dir,
+		Name: test.DownloadName,
+		Extra: map[string]any{
+			"connections": 2,
+		},
+	}
+	resolveReq = &model.ResolveTask{
+		Req: taskReq,
+	}
+	createReq = &model.CreateTask{
+		Req:  taskReq,
+		Opts: createOpts,
+	}
+	installExtensionReq = &model.InstallExtension{
+		URL: "https://github.com/GopeedLab/gopeed-extension-samples#github-contributor-avatars-sample",
+	}
+)
+
+func currentTestDownloadFile() string {
+	return filepath.Join(createOpts.Path, createOpts.Name)
+}
+
+func TestInfo(t *testing.T) {
+	matchKeys := []string{"version", "runtime", "os", "arch", "inDocker"}
+	doTest(func() {
+		resp := httpRequestCheckOk[map[string]any](http.MethodGet, "/api/v1/info", nil)
+		for _, key := range matchKeys {
+			if _, ok := resp[key]; !ok {
+				t.Errorf("Info() missing key = %v", key)
+			}
+		}
+	})
+}
+
+func TestResolve(t *testing.T) {
+	doTest(func() {
+		resp := httpRequestCheckOk[*download.ResolveResult](http.MethodPost, "/api/v1/resolve", resolveReq)
+		if !test.AssertResourceEqual(taskRes, resp.Res) {
+			t.Errorf("Resolve() got = %v, want %v", test.ToJson(resp.Res), test.ToJson(taskRes))
+		}
+	})
+}
+
+func TestCreateTask(t *testing.T) {
+	doTest(func() {
+		resp := httpRequestCheckOk[*download.ResolveResult](http.MethodPost, "/api/v1/resolve", resolveReq)
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		Downloader.Listener(func(event *download.Event) {
+			if event.Key == download.EventKeyFinally {
+				wg.Done()
+			}
+		})
+
+		taskId := httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", &model.CreateTask{
+			Rid:  resp.ID,
+			Opts: createOpts,
+		})
+		if taskId == "" {
+			t.Fatal("create task failed")
+		}
+
+		wg.Wait()
+		want := test.FileMd5(test.BuildFile)
+		got := test.FileMd5(currentTestDownloadFile())
+		if want != got {
+			t.Errorf("CreateTask() got = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestCreateResolvedTaskUsesSubmittedOptions(t *testing.T) {
+	doTest(func() {
+		done := make(chan *download.Event, 1)
+		Downloader.Listener(func(event *download.Event) {
+			if event.Key == download.EventKeyFinally {
+				done <- event
+			}
+		})
+		resolved := httpRequestCheckOk[*download.ResolveResult](http.MethodPost, "/api/v1/resolve", resolveReq)
+		opts := createOpts.Clone()
+		opts.Name = "selected-options.bin"
+		opts.SelectFiles = []int{0}
+		id := httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", &model.CreateTask{Rid: resolved.ID, Opts: opts})
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("resolved task did not finish")
+		}
+		task := Downloader.GetTask(id)
+		if task.Meta.Opts.Name != opts.Name || !reflect.DeepEqual(task.Meta.Opts.SelectFiles, opts.SelectFiles) {
+			t.Fatalf("submitted options were lost: %+v", task.Meta.Opts)
+		}
+		if got := test.FileMd5(filepath.Join(opts.Path, opts.Name)); got != test.FileMd5(test.BuildFile) {
+			t.Fatalf("download using submitted options has wrong checksum: %s", got)
+		}
+	})
+}
+
+func TestCreateDirectTask(t *testing.T) {
+	doTest(func() {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		Downloader.Listener(func(event *download.Event) {
+			if event.Key == download.EventKeyFinally {
+				wg.Done()
+			}
+		})
+
+		taskId := httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", createReq)
+		if taskId == "" {
+			t.Fatal("create task failed")
+		}
+
+		wg.Wait()
+		want := test.FileMd5(test.BuildFile)
+		got := test.FileMd5(currentTestDownloadFile())
+		if want != got {
+			t.Errorf("CreateDirectTask() got = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestGetTaskStatus(t *testing.T) {
+	doTest(func() {
+		resolved := httpRequestCheckOk[*download.ResolveResult](http.MethodPost, "/api/v1/resolve", resolveReq)
+		taskId := httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", &model.CreateTask{Rid: resolved.ID})
+		status := httpRequestCheckOk[*download.TaskRuntimeStatus](http.MethodGet, "/api/v1/tasks/"+taskId+"/status", nil)
+		if status.Total != test.BuildSize {
+			t.Fatalf("task status total = %d, want %d", status.Total, test.BuildSize)
+		}
+		if status.Files == nil {
+			t.Fatal("task status files must be an empty array or contain file progress, not null")
+		}
+
+		code, _ := httpRequest[*download.TaskRuntimeStatus](http.MethodGet, "/api/v1/tasks/missing/status", nil)
+		checkCode(code, model.CodeTaskNotFound)
+	})
+}
+
+func TestCreateDirectTaskBatch(t *testing.T) {
+	doTest(func() {
+		reqs := make([]*base.CreateTaskBatchItem, 0)
+		for i := 0; i < 5; i++ {
+			reqs = append(reqs, &base.CreateTaskBatchItem{
+				Req: createReq.Req,
+			})
+		}
+		result := httpRequestCheckOk[download.CreateTaskBatchResult](http.MethodPost, "/api/v1/tasks/batch", &base.CreateTaskBatch{
+			Reqs: reqs,
+		})
+		taskIds := result.TaskIDs
+		if len(taskIds) != len(reqs) {
+			t.Errorf("CreateDirectTaskBatch() got = %v, want %v", len(taskIds), len(reqs))
+		}
+	})
+}
+
+func TestCreateDirectTaskBatchWithOpt(t *testing.T) {
+	doTest(func() {
+		reqs := make([]*base.CreateTaskBatchItem, 0)
+		for i := 0; i < 5; i++ {
+			item := &base.CreateTaskBatchItem{
+				Req: createReq.Req,
+			}
+			if i == 0 {
+				item.Opts = &base.Options{
+					Name: "spe_opt.data",
+				}
+			}
+			reqs = append(reqs, item)
+		}
+		result := httpRequestCheckOk[download.CreateTaskBatchResult](http.MethodPost, "/api/v1/tasks/batch", &base.CreateTaskBatch{
+			Reqs: reqs,
+			Opts: &base.Options{
+				Name: "default_opt.data",
+			},
+		})
+		taskIds := result.TaskIDs
+		if len(taskIds) != len(reqs) {
+			t.Errorf("CreateDirectTaskBatch() got = %v, want %v", len(taskIds), len(reqs))
+		}
+
+		for i, taskId := range taskIds {
+			task := httpRequestCheckOk[*download.Task](http.MethodGet, "/api/v1/tasks/"+taskId, nil)
+			if i == 0 {
+				if !strings.Contains(task.Name(), "spe_opt") {
+					t.Errorf("CreateDirectTaskBatch() got = %v, want %v", task.Name(), "spe_opt.data")
+				}
+			} else {
+				if !strings.Contains(task.Name(), "default_opt") {
+					t.Errorf("CreateDirectTaskBatch() got = %v, want %v", task.Name(), "default_opt.data")
+				}
+			}
+		}
+	})
+}
+
+func TestCreateDirectTaskBatchWithGroup(t *testing.T) {
+	doTest(func() {
+		cfg, err := Downloader.GetConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.MaxRunning = 0
+		if err := Downloader.PutConfig(cfg); err != nil {
+			t.Fatal(err)
+		}
+		parent := t.TempDir()
+		result := httpRequestCheckOk[download.CreateTaskBatchResult](http.MethodPost, "/api/v1/tasks/batch", &base.CreateTaskBatch{
+			Reqs: []*base.CreateTaskBatchItem{{Req: createReq.Req}, {Req: createReq.Req}},
+			Opts: &base.Options{Path: parent}, Group: true, GroupName: "folder",
+		})
+		if result.ParentID == "" || len(result.TaskIDs) != 2 {
+			t.Fatalf("unexpected group result: %+v", result)
+		}
+		all := httpRequestCheckOk[[]map[string]any](http.MethodGet, "/api/v1/tasks", nil)
+		if len(all) != 2 {
+			t.Fatalf("expected real tasks only, got %d", len(all))
+		}
+		for _, task := range all {
+			if task["parentId"] != result.ParentID || task["type"] != nil {
+				t.Fatalf("invalid member: %+v", task)
+			}
+			metadata, ok := task["group"].(map[string]any)
+			if !ok || metadata["path"] != filepath.Join(parent, "folder") || metadata["name"] != "folder" {
+				t.Fatalf("missing group metadata: %+v", task)
+			}
+		}
+	})
+}
+
+func TestPauseAndContinueTask(t *testing.T) {
+	doTest(func() {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		Downloader.Listener(func(event *download.Event) {
+			switch event.Key {
+			case download.EventKeyFinally:
+				wg.Done()
+			}
+		})
+
+		taskId := httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", createReq)
+		t1 := httpRequestCheckOk[*download.Task](http.MethodGet, "/api/v1/tasks/"+taskId, nil)
+		if t1.Status != base.DownloadStatusRunning {
+			t.Errorf("CreateTask() got = %v, want %v", t1.Status, base.DownloadStatusRunning)
+		}
+		httpRequestCheckOk[any](http.MethodPut, "/api/v1/tasks/"+taskId+"/pause", nil)
+		t2 := httpRequestCheckOk[*download.Task](http.MethodGet, "/api/v1/tasks/"+taskId, nil)
+		if t2.Status != base.DownloadStatusPause {
+			t.Errorf("PauseTask() got = %v, want %v", t2.Status, base.DownloadStatusPause)
+		}
+		time.Sleep(time.Millisecond * 100)
+		httpRequestCheckOk[any](http.MethodPut, "/api/v1/tasks/"+taskId+"/continue", nil)
+		t3 := httpRequestCheckOk[*download.Task](http.MethodGet, "/api/v1/tasks/"+taskId, nil)
+		if t3.Status != base.DownloadStatusRunning {
+			t.Errorf("ContinueTask() got = %v, want %v", t3.Status, base.DownloadStatusRunning)
+		}
+
+		wg.Wait()
+		want := test.FileMd5(test.BuildFile)
+		got := test.FileMd5(currentTestDownloadFile())
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("PauseAndContinueTask() got = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestPatchTask(t *testing.T) {
+	doTest(func() {
+		// Create a task
+		taskId := httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", createReq)
+		if taskId == "" {
+			t.Fatal("create task failed")
+		}
+
+		// Pause the task
+		httpRequestCheckOk[any](http.MethodPut, "/api/v1/tasks/"+taskId+"/pause", nil)
+		time.Sleep(time.Millisecond * 100)
+
+		// Patch the task with new labels
+		patchReq := &model.PatchTask{
+			Req: &base.Request{
+				Labels: map[string]string{
+					"patched": "true",
+					"version": "2",
+				},
+			},
+		}
+		httpRequestCheckOk[any](http.MethodPatch, "/api/v1/tasks/"+taskId, patchReq)
+
+		// Verify the patch was applied
+		task := httpRequestCheckOk[*download.Task](http.MethodGet, "/api/v1/tasks/"+taskId, nil)
+		if task.Meta.Req.Labels["patched"] != "true" {
+			t.Errorf("PatchTask() label 'patched' = %v, want %v", task.Meta.Req.Labels["patched"], "true")
+		}
+		if task.Meta.Req.Labels["version"] != "2" {
+			t.Errorf("PatchTask() label 'version' = %v, want %v", task.Meta.Req.Labels["version"], "2")
+		}
+
+		// Clean up
+		httpRequestCheckOk[any](http.MethodDelete, "/api/v1/tasks/"+taskId+"?force=true", nil)
+	})
+}
+
+func TestPatchTaskNotFound(t *testing.T) {
+	doTest(func() {
+		// Try to patch a non-existent task
+		patchReq := &model.PatchTask{
+			Req: &base.Request{
+				Labels: map[string]string{
+					"test": "value",
+				},
+			},
+		}
+		code, _ := httpRequest[any](http.MethodPatch, "/api/v1/tasks/non-existent-id", patchReq)
+		if code != int(model.CodeTaskNotFound) {
+			t.Errorf("PatchTaskNotFound() result code = %v, want %v", code, model.CodeTaskNotFound)
+		}
+	})
+}
+
+func TestPauseAllAndContinueALLTasks(t *testing.T) {
+	doTest(func() {
+		slowListener := test.StartTestLowSpeedServer(5 * time.Nanosecond)
+		defer slowListener.Close()
+		taskReq.URL = "http://" + slowListener.Addr().String() + "/" + test.BuildName
+
+		cfg, err := Downloader.GetConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		createAndPause := func() {
+			taskId := httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", createReq)
+			time.Sleep(time.Millisecond * 5)
+			httpRequestCheckOk[*download.Task](http.MethodPut, "/api/v1/tasks/"+taskId+"/pause", nil)
+		}
+
+		total := cfg.MaxRunning + 2
+		for i := 0; i < total; i++ {
+			createAndPause()
+		}
+		time.Sleep(time.Millisecond * 50)
+
+		// continue all
+		httpRequestCheckOk[any](http.MethodPut, "/api/v1/tasks/continue", nil)
+		time.Sleep(time.Millisecond * 100)
+		tasks := httpRequestCheckOk[[]*download.Task](http.MethodGet, fmt.Sprintf("/api/v1/tasks?status=%s", base.DownloadStatusRunning), nil)
+		if len(tasks) != cfg.MaxRunning {
+			t.Errorf("ContinueAllTasks() got = %v, want %v", len(tasks), cfg.MaxRunning)
+		}
+		// pause all
+		httpRequestCheckOk[any](http.MethodPut, "/api/v1/tasks/pause", nil)
+		time.Sleep(time.Millisecond * 100)
+		tasks = httpRequestCheckOk[[]*download.Task](http.MethodGet, fmt.Sprintf("/api/v1/tasks?status=%s", base.DownloadStatusPause), nil)
+		if len(tasks) != total {
+			t.Errorf("PauseAllTasks() got = %v, want %v", len(tasks), total)
+		}
+	})
+}
+
+func TestDeleteTask(t *testing.T) {
+	doTest(func() {
+		taskId := httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", createReq)
+		time.Sleep(time.Millisecond * 200)
+		httpRequestCheckOk[any](http.MethodDelete, "/api/v1/tasks/"+taskId, nil)
+		code, _ := httpRequest[*download.Task](http.MethodGet, "/api/v1/tasks/"+taskId, nil)
+		checkCode(code, model.CodeTaskNotFound)
+	})
+}
+
+func TestDeleteTaskForce(t *testing.T) {
+	doTest(func() {
+		taskId := httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", createReq)
+		time.Sleep(time.Millisecond * 200)
+		httpRequestCheckOk[any](http.MethodDelete, "/api/v1/tasks/"+taskId+"?force=true", nil)
+		code, _ := httpRequest[*download.Task](http.MethodGet, "/api/v1/tasks/"+taskId, nil)
+		checkCode(code, model.CodeTaskNotFound)
+		if _, err := os.Stat(currentTestDownloadFile()); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("DeleteTaskForce() got = %v, want %v", err, os.ErrNotExist)
+		}
+	})
+}
+
+func TestDeleteAllTasks(t *testing.T) {
+	doTest(func() {
+		taskCount := 3
+
+		var wg sync.WaitGroup
+		wg.Add(taskCount)
+		Downloader.Listener(func(event *download.Event) {
+			if event.Key == download.EventKeyFinally {
+				wg.Done()
+			}
+		})
+
+		for i := 0; i < taskCount; i++ {
+			httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", createReq)
+		}
+
+		wg.Wait()
+
+		httpRequestCheckOk[any](http.MethodDelete, "/api/v1/tasks?force=true", nil)
+		tasks := httpRequestCheckOk[[]*download.Task](http.MethodGet, "/api/v1/tasks", nil)
+		if len(tasks) != 0 {
+			t.Errorf("DeleteTasks() got = %v, want %v", len(tasks), 0)
+		}
+	})
+}
+
+func TestDeleteTasksByStatues(t *testing.T) {
+	doTest(func() {
+		taskCount := 3
+
+		var wg sync.WaitGroup
+		wg.Add(taskCount)
+		Downloader.Listener(func(event *download.Event) {
+			if event.Key == download.EventKeyFinally {
+				wg.Done()
+			}
+		})
+
+		for i := 0; i < taskCount; i++ {
+			httpRequestCheckOk[string](http.MethodPost, "/api/v1/tasks", createReq)
+		}
+
+		wg.Wait()
+
+		httpRequestCheckOk[any](http.MethodDelete, fmt.Sprintf("/api/v1/tasks?status=%s&force=true", base.DownloadStatusDone), nil)
+		tasks := httpRequestCheckOk[[]*download.Task](http.MethodGet, "/api/v1/tasks", nil)
+		if len(tasks) != 0 {
+			t.Errorf("DeleteTasks() got = %v, want %v", len(tasks), 0)
+		}
+	})
+}
+
+func TestGetTasks(t *testing.T) {
+	doTest(func() {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		Downloader.Listener(func(event *download.Event) {
+			if event.Key == download.EventKeyFinally {
+				wg.Done()
+			}
+		})
+
+		httpRequestCheckOk[string](http.MethodPost, fmt.Sprintf("/api/v1/tasks?status=%s&status=%s",
+			base.DownloadStatusReady, base.DownloadStatusRunning), createReq)
+		httpRequestCheckOk[[]*download.Task](http.MethodGet, "/api/v1/tasks", nil)
+
+		wg.Wait()
+		r := httpRequestCheckOk[[]*download.Task](http.MethodGet, fmt.Sprintf("/api/v1/tasks?status=%s",
+			base.DownloadStatusDone), nil)
+		if r[0].Status != base.DownloadStatusDone {
+			t.Errorf("GetTasks() got = %v, want %v", r[0].Status, base.DownloadStatusDone)
+		}
+		r = httpRequestCheckOk[[]*download.Task](http.MethodGet, fmt.Sprintf("/api/v1/tasks?status=%s,%s",
+			base.DownloadStatusReady, base.DownloadStatusRunning), nil)
+		if len(r) > 0 {
+			t.Errorf("GetTasks() got = %v, want %v", len(r), 0)
+		}
+	})
+}
+
+func TestGetAndPutConfig(t *testing.T) {
+	doTest(func() {
+		cfg := httpRequestCheckOk[*base.DownloaderStoreConfig](http.MethodGet, "/api/v1/config", nil)
+		cfg.DownloadDir = "./download"
+		cfg.AutoStartTasks = true
+		cfg.Extra = map[string]any{
+			"serverConfig": &Config{
+				Host: "127.0.0.1",
+				Port: 8080,
+			},
+			"theme": "dark",
+		}
+		httpRequestCheckOk[any](http.MethodPut, "/api/v1/config", cfg)
+
+		newCfg := httpRequestCheckOk[*base.DownloaderStoreConfig](http.MethodGet, "/api/v1/config", nil)
+		if !test.JsonEqual(cfg, newCfg) {
+			t.Errorf("GetAndPutConfig() got = %v, want %v", test.ToJson(newCfg), test.ToJson(cfg))
+		}
+	})
+}
+
+func TestInstallExtension(t *testing.T) {
+	doTest(func() {
+		identity := httpRequestCheckOk[string](http.MethodPost, "/api/v1/extensions", installExtensionReq)
+		if identity == "" {
+			t.Errorf("InstallExtension() got = %v, want %v", identity, "not empty")
+		}
+
+		// not a valid extension repository
+		code, _ := httpRequest[string](http.MethodPost, "/api/v1/extensions", &model.InstallExtension{
+			URL: "https://github.com/GopeedLab/gopeed",
+		})
+		checkCode(code, model.CodeError)
+
+		// not a git repository
+		code, _ = httpRequest[string](http.MethodPost, "/api/v1/extensions", &model.InstallExtension{
+			URL: "https://github.com",
+		})
+		checkCode(code, model.CodeError)
+	})
+}
+
+func TestGetExtensions(t *testing.T) {
+	doTest(func() {
+		httpRequestCheckOk[string](http.MethodPost, "/api/v1/extensions", installExtensionReq)
+		extensions := httpRequestCheckOk[[]*download.Extension](http.MethodGet, "/api/v1/extensions", nil)
+		if len(extensions) == 0 {
+			t.Errorf("GetExtensions() got = %v, want %v", len(extensions), "not empty")
+		}
+	})
+}
+
+func TestUpdateExtensionSettings(t *testing.T) {
+	doTest(func() {
+		identity := httpRequestCheckOk[string](http.MethodPost, "/api/v1/extensions", installExtensionReq)
+
+		httpRequestCheckOk[any](http.MethodPut, "/api/v1/extensions/"+identity+"/settings", &model.UpdateExtensionSettings{
+			Settings: map[string]any{
+				"undefined": "test",
+				"ua":        "test",
+			},
+		})
+
+		settings := httpRequestCheckOk[*download.Extension](http.MethodGet, "/api/v1/extensions/"+identity, nil).Settings
+		if len(settings) != 1 {
+			t.Errorf("UpdateExtensionSettings() got = %v, want %v", len(settings), 1)
+		}
+
+		if settings[0].Name != "ua" || settings[0].Value != "test" {
+			t.Errorf("UpdateExtensionSettings() got = %v, want %v", settings[0].Value, "test")
+		}
+	})
+}
+
+func TestSwitchExtension(t *testing.T) {
+	doTest(func() {
+		identity := httpRequestCheckOk[string](http.MethodPost, "/api/v1/extensions", installExtensionReq)
+		httpRequestCheckOk[any](http.MethodPut, "/api/v1/extensions/"+identity+"/switch", &model.SwitchExtension{
+			Status: false,
+		})
+		extensions := httpRequestCheckOk[[]*download.Extension](http.MethodGet, "/api/v1/extensions", nil)
+		if !extensions[0].Disabled {
+			t.Errorf("TestSwitchExtension() got = %v, want %v", extensions[0].Disabled, true)
+		}
+	})
+}
+
+func TestDeleteExtension(t *testing.T) {
+	doTest(func() {
+		identity := httpRequestCheckOk[string](http.MethodPost, "/api/v1/extensions", installExtensionReq)
+		httpRequestCheckOk[any](http.MethodDelete, "/api/v1/extensions/"+identity, nil)
+		extensions := httpRequestCheckOk[[]*download.Extension](http.MethodGet, "/api/v1/extensions", nil)
+		if len(extensions) != 0 {
+			t.Errorf("TestDeleteExtension() got = %v, want %v", len(extensions), 0)
+		}
+	})
+}
+
+func TestUpdateCheckExtension(t *testing.T) {
+	doTest(func() {
+		identity := httpRequestCheckOk[string](http.MethodPost, "/api/v1/extensions", installExtensionReq)
+		resp := httpRequestCheckOk[*model.UpdateCheckExtensionResp](http.MethodGet, "/api/v1/extensions/"+identity+"/update", nil)
+		// no new version
+		if resp.NewVersion != "" {
+			t.Errorf("UpdateCheckExtension() got = %v, want %v", resp.NewVersion, "")
+		}
+		// force update
+		httpRequestCheckOk[any](http.MethodPost, "/api/v1/extensions/"+identity+"/update", nil)
+	})
+}
+
+func TestFsExtension(t *testing.T) {
+	doTest(func() {
+		identity := httpRequestCheckOk[string](http.MethodPost, "/api/v1/extensions", installExtensionReq)
+		statusCode, _ := doHttpRequest0(http.MethodGet, "/fs/extensions/"+identity+"/icon.png", nil, nil)
+		if statusCode != http.StatusOK {
+			t.Errorf("FsExtension() got = %v, want %v", statusCode, http.StatusOK)
+		}
+	})
+}
+
+func TestFsExtensionFail(t *testing.T) {
+	doTest(func() {
+		statusCode, _ := doHttpRequest0(http.MethodGet, "/fs/extensions/not_exist/icon.png", nil, nil)
+		if statusCode != http.StatusNotFound {
+			t.Errorf("TestFsExtensionFail() got = %v, want %v", statusCode, http.StatusNotFound)
+		}
+	})
+}
+
+func TestWebFsEnhance(t *testing.T) {
+	indexHtml := `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<title>index</title>
+</head>
+<body>
+	<h1>index</h1>
+</body>
+</html>
+`
+	webDistPath := "dist"
+	os.MkdirAll("dist", os.ModePerm)
+	if err := os.WriteFile(filepath.Join(webDistPath, "index.html"), []byte(indexHtml), os.ModePerm); err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(webDistPath)
+
+	doTest0(func(cfg *model.StartConfig) {
+		cfg.WebFS = os.DirFS(webDistPath)
+	}, func() {
+		// First request no cache
+		code, header, _ := doHttpRequest1(http.MethodGet, "/index.html", map[string]string{
+			"Accept-Encoding": "gzip",
+		}, nil)
+		if code != http.StatusOK {
+			t.Errorf("TestWebFsEnhance() got = %v, want %v", code, http.StatusOK)
+		}
+		// Check header last-modified
+		if _, ok := header["Last-Modified"]; !ok {
+			t.Errorf("TestWebFsEnhance() missing key = %v", "Last-Modified")
+		}
+		// Check gzip compress
+		if _, ok := header["Content-Encoding"]; !ok || header["Content-Encoding"] != "gzip" {
+			t.Errorf("TestWebFsEnhance() no gzip compress")
+		}
+
+		// Request with If-Modified-Since
+		ifModifiedSince := header["Last-Modified"]
+		code, _, _ = doHttpRequest1(http.MethodGet, "/index.html", map[string]string{
+			"If-Modified-Since": ifModifiedSince,
+		}, nil)
+		if code != http.StatusNotModified {
+			t.Errorf("TestWebFsEnhance() got = %v, want %v", code, http.StatusNotModified)
+		}
+
+		// Request with un gzip
+		code, header, _ = doHttpRequest1(http.MethodGet, "/index.html?t=123", nil, nil)
+		if code != http.StatusOK {
+			t.Errorf("TestWebFsEnhance() got = %v, want %v", code, http.StatusOK)
+		}
+		// Check no gzip compress
+		if _, ok := header["Content-Encoding"]; ok && header["Content-Encoding"] == "gzip" {
+			t.Errorf("TestWebFsEnhance() has gzip compress")
+		}
+	})
+}
+
+func TestUnknownAPIPathsReturn404(t *testing.T) {
+	for _, webEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("web=%t", webEnabled), func(t *testing.T) {
+			doTest0(func(cfg *model.StartConfig) {
+				cfg.WebEnable = webEnabled
+				cfg.WebFS = fstest.MapFS{
+					"index.html":     &fstest.MapFile{Data: []byte("<html>app</html>")},
+					"api/static.txt": &fstest.MapFile{Data: []byte("must not serve API paths as files")},
+					"apiary":         &fstest.MapFile{Data: []byte("namespace boundary")},
+				}
+			}, func() {
+				paths := []string{"/api", "/api/", "/api/missing", "/api/v1/missing", "/api/web/missing", "/api/web/login", "/api/static.txt"}
+				for _, path := range paths {
+					for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead} {
+						code, body := doHttpRequest0(method, path, nil, nil)
+						if code != http.StatusNotFound {
+							t.Fatalf("%s %s status %d, want 404: %s", method, path, code, body)
+						}
+						if strings.Contains(string(body), "<html>app</html>") {
+							t.Fatalf("%s %s fell through to web files", method, path)
+						}
+					}
+				}
+				// Known API routes still run, while unsupported methods use the API fallback.
+				code, _ := doHttpRequest0(http.MethodGet, "/api/v1/info", nil, nil)
+				if code != http.StatusOK {
+					t.Fatalf("known API status %d, want 200", code)
+				}
+				code, _ = doHttpRequest0(http.MethodPost, "/api/v1/info", nil, nil)
+				if code != http.StatusNotFound {
+					t.Fatalf("unsupported API method status %d, want 404", code)
+				}
+				if webEnabled {
+					for path, want := range map[string]string{"/": "<html>app</html>", "/apiary": "namespace boundary"} {
+						code, body := doHttpRequest0(http.MethodGet, path, map[string]string{"Accept-Encoding": "identity"}, nil)
+						if code != http.StatusOK || !strings.Contains(string(body), want) {
+							t.Fatalf("web file %s status %d body %s", path, code, body)
+						}
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestTestWebhook(t *testing.T) {
+	doTest(func() {
+		// Set up a mock webhook server
+		webhookReceived := false
+		var receivedData map[string]interface{}
+		var wg sync.WaitGroup
+		wg.Add(1)
+
+		webhookServer := http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+
+				if err := json.Unmarshal(body, &receivedData); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+
+				// Check Content-Type
+				if r.Header.Get("Content-Type") != "application/json" {
+					t.Errorf("TestWebhook() Content-Type got = %v, want %v", r.Header.Get("Content-Type"), "application/json")
+				}
+
+				webhookReceived = true
+				w.WriteHeader(http.StatusOK)
+				wg.Done()
+			}),
+		}
+
+		// Start webhook server
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		webhookPort := listener.Addr().(*net.TCPAddr).Port
+		webhookURL := fmt.Sprintf("http://127.0.0.1:%d/webhook", webhookPort)
+
+		go webhookServer.Serve(listener)
+		defer webhookServer.Close()
+
+		// Test with valid webhook URL
+		httpRequestCheckOk[any](http.MethodPost, "/api/v1/webhook/test", &model.TestWebhookReq{
+			URL: webhookURL,
+		})
+
+		// Wait for webhook to be received
+		wg.Wait()
+
+		if !webhookReceived {
+			t.Error("TestWebhook() webhook was not received")
+		}
+
+		// Verify webhook data structure
+		if receivedData["event"] == nil {
+			t.Error("TestWebhook() missing 'event' field")
+		}
+		if receivedData["time"] == nil {
+			t.Error("TestWebhook() missing 'time' field")
+		}
+		if receivedData["payload"] == nil {
+			t.Error("TestWebhook() missing 'payload' field")
+		}
+
+		// Test with invalid webhook URL
+		code, _ := httpRequest[any](http.MethodPost, "/api/v1/webhook/test", &model.TestWebhookReq{
+			URL: "http://invalid-webhook-url-that-does-not-exist.local:99999/webhook",
+		})
+		checkCode(code, model.CodeError)
+
+		// Test with empty URL
+		code, _ = httpRequest[any](http.MethodPost, "/api/v1/webhook/test", &model.TestWebhookReq{
+			URL: "",
+		})
+		checkCode(code, model.CodeError)
+
+		// Test with webhook server returning non-200 status
+		wg.Add(1)
+		badWebhookServer := http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				wg.Done()
+			}),
+		}
+		badListener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		badWebhookPort := badListener.Addr().(*net.TCPAddr).Port
+		badWebhookURL := fmt.Sprintf("http://127.0.0.1:%d/webhook", badWebhookPort)
+
+		go badWebhookServer.Serve(badListener)
+		defer badWebhookServer.Close()
+
+		code, _ = httpRequest[any](http.MethodPost, "/api/v1/webhook/test", &model.TestWebhookReq{
+			URL: badWebhookURL,
+		})
+		checkCode(code, model.CodeError)
+
+		wg.Wait()
+	})
+}
+
+func TestApiToken(t *testing.T) {
+	var cfg = &model.StartConfig{}
+	cfg.Init()
+	cfg.ApiToken = "123456"
+	cfg.MCPEnable = true
+	fileListener := doStart(cfg)
+	defer func() {
+		if err := fileListener.Close(); err != nil {
+			panic(err)
+		}
+		Stop()
+	}()
+
+	status, _ := doHttpRequest0(http.MethodGet, "/api/v1/config", nil, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("TestApiToken() got = %v, want %v", status, http.StatusUnauthorized)
+	}
+
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", map[string]string{
+		"X-Api-Token": cfg.ApiToken,
+	}, nil)
+	if status != http.StatusOK {
+		t.Errorf("TestApiToken() got = %v, want %v", status, http.StatusOK)
+	}
+
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", map[string]string{
+		"Authorization": "Bearer " + cfg.ApiToken,
+	}, nil)
+	if status != http.StatusOK {
+		t.Errorf("Bearer API token status = %v, want %v", status, http.StatusOK)
+	}
+
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", map[string]string{
+		"Authorization": "bearer " + cfg.ApiToken,
+	}, nil)
+	if status != http.StatusOK {
+		t.Errorf("case-insensitive Bearer API token status = %v, want %v", status, http.StatusOK)
+	}
+
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", map[string]string{
+		"Authorization": "Bearer invalid",
+	}, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("invalid Bearer API token status = %v, want %v", status, http.StatusUnauthorized)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/api/v1/config", restPort), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Api-Token", "invalid")
+	request.Header.Set("Authorization", "Bearer "+cfg.ApiToken)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Errorf("one valid token header status = %v, want %v", response.StatusCode, http.StatusOK)
+	}
+
+	mcpInitialize := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-11-25",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "gopeed-test", "version": "1.0.0"},
+		},
+	}
+	status, _ = doHttpRequest0(http.MethodPost, "/mcp", map[string]string{
+		"Accept":       "application/json, text/event-stream",
+		"Content-Type": "application/json",
+	}, mcpInitialize)
+	if status != http.StatusUnauthorized {
+		t.Errorf("unauthenticated MCP status = %v, want %v", status, http.StatusUnauthorized)
+	}
+	status, _ = doHttpRequest0(http.MethodPost, "/mcp", map[string]string{
+		"Accept":        "application/json, text/event-stream",
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer " + cfg.ApiToken,
+	}, mcpInitialize)
+	if status != http.StatusOK {
+		t.Errorf("Bearer-authenticated MCP status = %v, want %v", status, http.StatusOK)
+	}
+
+}
+
+func TestMCPRouteToggle(t *testing.T) {
+	initialize := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-11-25",
+			"capabilities":    map[string]any{},
+			"clientInfo": map[string]any{
+				"name":    "gopeed-test",
+				"version": "1.0.0",
+			},
+		},
+	}
+	headers := map[string]string{
+		"Accept":       "application/json, text/event-stream",
+		"Content-Type": "application/json",
+	}
+
+	t.Run("disabled", func(t *testing.T) {
+		cfg := (&model.StartConfig{Storage: model.StorageMem, ApiToken: "secret"}).Init()
+		fileListener := doStart(cfg)
+		defer fileListener.Close()
+		defer Stop()
+
+		status, _ := doHttpRequest0(http.MethodPost, "/mcp", headers, initialize)
+		if status != http.StatusNotFound {
+			t.Fatalf("disabled MCP status = %d, want %d", status, http.StatusNotFound)
+		}
+	})
+
+	t.Run("enabled", func(t *testing.T) {
+		cfg := (&model.StartConfig{Storage: model.StorageMem, MCPEnable: true}).Init()
+		fileListener := doStart(cfg)
+		defer fileListener.Close()
+		defer Stop()
+
+		status, _ := doHttpRequest0(http.MethodPost, "/mcp", headers, initialize)
+		if status != http.StatusOK {
+			t.Fatalf("enabled MCP status = %d, want %d", status, http.StatusOK)
+		}
+	})
+}
+
+func TestBuildServerRejectsWebAPITokenWithoutWebAuth(t *testing.T) {
+	cfg := (&model.StartConfig{
+		Storage:   model.StorageMem,
+		WebEnable: true,
+		ApiToken:  "123456",
+	}).Init()
+
+	server, listener, err := BuildServer(cfg)
+	if err == nil {
+		if listener != nil {
+			listener.Close()
+		}
+		if server != nil {
+			server.Close()
+		}
+		t.Fatal("BuildServer() should reject an API token without web authentication")
+	}
+	if server != nil || listener != nil {
+		t.Fatal("invalid web authentication config must fail before opening a listener")
+	}
+}
+
+func TestAuthorization(t *testing.T) {
+	var cfg = &model.StartConfig{}
+	cfg.Init()
+	cfg.ApiToken = "123456"
+	cfg.WebEnable = true
+	cfg.WebAuth = &model.WebAuth{
+		Username: "admin",
+		Password: "123456",
+	}
+	fileListener := doStart(cfg)
+	defer func() {
+		if err := fileListener.Close(); err != nil {
+			panic(err)
+		}
+		Stop()
+	}()
+
+	status, _ := doHttpRequest0(http.MethodPost, "/api/web/login", nil, &model.WebAuth{
+		Username: "xxx",
+		Password: "xxx",
+	})
+	if status != http.StatusUnauthorized {
+		t.Errorf("TestAuthorization() got = %v, want %v", status, http.StatusUnauthorized)
+	}
+
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", nil, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("TestAuthorization() got = %v, want %v", status, http.StatusUnauthorized)
+	}
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", map[string]string{
+		"Authorization": "Bearer invalid-session",
+	}, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("Bearer-authenticated API status = %v, want %v", status, http.StatusUnauthorized)
+	}
+
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", map[string]string{
+		"Cookie": webAuthCookieName + "=invalid-session",
+	}, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("TestAuthorization() got = %v, want %v", status, http.StatusUnauthorized)
+	}
+
+	status, loginHeaders, loginBody := doHttpRequest1(http.MethodPost, "/api/web/login", nil, cfg.WebAuth)
+	if status != http.StatusOK {
+		t.Fatalf("cookie login got = %v, want %v", status, http.StatusOK)
+	}
+	setCookie := loginHeaders["Set-Cookie"]
+	if !strings.Contains(setCookie, webAuthCookieName+"=") ||
+		!strings.Contains(setCookie, "HttpOnly") ||
+		!strings.Contains(setCookie, "SameSite=Lax") {
+		t.Fatalf("unexpected auth cookie: %q", setCookie)
+	}
+	cookieHeader := strings.SplitN(setCookie, ";", 2)[0]
+	sessionID := strings.TrimPrefix(cookieHeader, webAuthCookieName+"=")
+	if sessionID == "" || strings.Contains(string(loginBody), sessionID) {
+		t.Fatalf("session id must only be returned in the HttpOnly cookie")
+	}
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", map[string]string{
+		"Cookie": cookieHeader,
+	}, nil)
+	if status != http.StatusOK {
+		t.Errorf("cookie authorization got = %v, want %v", status, http.StatusOK)
+	}
+	status, _ = doHttpRequest0(http.MethodGet, "/fs/extensions/not_exist/icon.png", nil, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("unauthenticated fs request got = %v, want %v", status, http.StatusUnauthorized)
+	}
+	status, _ = doHttpRequest0(http.MethodGet, "/fs/extensions/not_exist/icon.png", map[string]string{
+		"Cookie": cookieHeader,
+	}, nil)
+	if status != http.StatusNotFound {
+		t.Errorf("authenticated fs request got = %v, want %v", status, http.StatusNotFound)
+	}
+	status, _ = doHttpRequest0(http.MethodGet, "/fs/tasks/not_exist/file.png", nil, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("unauthenticated task fs request got = %v, want %v", status, http.StatusUnauthorized)
+	}
+	status, _ = doHttpRequest0(http.MethodGet, "/fs/tasks/not_exist/file.png", map[string]string{
+		"Cookie": cookieHeader,
+	}, nil)
+	if status != http.StatusNotFound {
+		t.Errorf("authenticated task fs request got = %v, want %v", status, http.StatusNotFound)
+	}
+	status, _ = doHttpRequest0(http.MethodGet, "/fs/future-resource", nil, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("unauthenticated future /fs route got = %v, want %v", status, http.StatusUnauthorized)
+	}
+	status, _ = doHttpRequest0(http.MethodGet, "/fs/future-resource", map[string]string{
+		"Authorization": "Bearer " + sessionID,
+	}, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("Bearer-only future /fs route got = %v, want %v", status, http.StatusUnauthorized)
+	}
+
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", map[string]string{
+		"X-Api-Token": cfg.ApiToken,
+	}, nil)
+	if status != http.StatusOK {
+		t.Errorf("TestAuthorization() got = %v, want %v", status, http.StatusOK)
+	}
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", map[string]string{
+		"Cookie":      cookieHeader,
+		"X-Api-Token": cfg.ApiToken,
+	}, nil)
+	if status != http.StatusOK {
+		t.Errorf("cookie and API token authorization got = %v, want %v", status, http.StatusOK)
+	}
+
+	status, _ = doHttpRequest0(http.MethodGet, "/api/v1/config", map[string]string{
+		"Cookie":      cookieHeader,
+		"X-Api-Token": "",
+	}, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("TestAuthorization() got = %v, want %v", status, http.StatusUnauthorized)
+	}
+}
+
+func TestWebSessionStoreExpiry(t *testing.T) {
+	now := time.Date(2026, time.August, 30, 12, 0, 0, 0, time.UTC)
+	store := newWebSessionStore()
+	store.now = func() time.Time { return now }
+
+	sessionID, expiresAt, err := store.create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessionID == "" || expiresAt != now.Add(webAuthSessionTTL) {
+		t.Fatalf("unexpected session: id=%q expiresAt=%v", sessionID, expiresAt)
+	}
+	if !store.valid(sessionID) {
+		t.Fatal("new session should be valid")
+	}
+
+	now = expiresAt
+	if store.valid(sessionID) {
+		t.Fatal("expired session should be invalid")
+	}
+}
+
+func TestBuildServerPropagatesWebViewProvider(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	listener.Close()
+
+	cfg := &model.StartConfig{
+		Network:         "tcp",
+		Address:         addr,
+		Storage:         model.StorageMem,
+		WebViewProvider: fakeRestWebViewProvider{available: true},
+	}
+
+	server, serverListener, err := BuildServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverListener.Close()
+	defer server.Close()
+	defer func() {
+		if Downloader != nil {
+			Downloader.Clear()
+			Downloader = nil
+		}
+	}()
+
+	runtime, err := Downloader.NewExtensionEngine(&download.Extension{
+		Name:    "test-runtime",
+		Author:  "gopeed",
+		Title:   "Gopeed Test Script Runtime",
+		Version: "0.0.0",
+		DevMode: true,
+	}, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	value, err := runtime.Eval("(async () => await gopeed.runtime.webview.isAvailable())()")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != true {
+		t.Fatalf("expected provider to reach downloader runtime, got %#v", value)
+	}
+}
+
+func doTest(handler func()) {
+	doTest0(nil, handler)
+}
+
+func doTest0(onStart func(cfg *model.StartConfig), handler func()) {
+	testFunc := func(storage model.Storage) {
+		downloadDir, err := os.MkdirTemp("", "gopeed-rest-test-download-")
+		if err != nil {
+			panic(err)
+		}
+		defer os.RemoveAll(downloadDir)
+		oldCreatePath := createOpts.Path
+		createOpts.Path = downloadDir
+		defer func() {
+			createOpts.Path = oldCreatePath
+		}()
+
+		var cfg = &model.StartConfig{}
+		cfg.Init()
+		cfg.Storage = storage
+		cfg.StorageDir = ".test_storage"
+		cfg.DownloadConfig = (&base.DownloaderStoreConfig{DownloadDir: downloadDir}).Init()
+		cfg.WebEnable = true
+		if onStart != nil {
+			onStart(cfg)
+		}
+		fileListener := doStart(cfg)
+		// The server process configures the default download directory on first
+		// load; a task without a base directory is rejected without it.
+		if current, err := Downloader.GetConfig(); err == nil {
+			current.DownloadDir = downloadDir
+			if err := Downloader.PutConfig(current); err != nil {
+				panic(err)
+			}
+		}
+		defer func() {
+			if err := fileListener.Close(); err != nil {
+				panic(err)
+			}
+			Stop()
+			Downloader.Clear()
+		}()
+		defer func() {
+			time.Sleep(500 * time.Millisecond)
+			Downloader.Pause(nil)
+			Downloader.Delete(nil, true)
+			os.RemoveAll(cfg.StorageDir)
+		}()
+		taskReq.URL = "http://" + fileListener.Addr().String() + "/" + test.BuildName
+		handler()
+	}
+	testFunc(model.StorageMem)
+	testFunc(model.StorageBolt)
+}
+
+func doStart(cfg *model.StartConfig) net.Listener {
+	port, err := Start(cfg)
+	if err != nil {
+		panic(err)
+	}
+	restPort = port
+	return test.StartTestFileServer()
+}
+
+type fakeRestWebViewProvider struct {
+	available bool
+}
+
+func (p fakeRestWebViewProvider) IsAvailable() bool {
+	return p.available
+}
+
+func (p fakeRestWebViewProvider) Open(enginewebview.OpenOptions) (enginewebview.Page, error) {
+	return fakeRestPage{}, nil
+}
+
+type fakeRestPage struct{}
+
+func (fakeRestPage) AddInitScript(string) error {
+	return nil
+}
+
+func (fakeRestPage) Goto(string, enginewebview.GotoOptions) error {
+	return nil
+}
+
+func (fakeRestPage) Execute(string, ...any) (any, error) {
+	return nil, nil
+}
+
+func (fakeRestPage) GetCookies() ([]enginewebview.Cookie, error) {
+	return nil, nil
+}
+
+func (fakeRestPage) SetCookie(enginewebview.Cookie) error {
+	return nil
+}
+
+func (fakeRestPage) DeleteCookie(enginewebview.Cookie) error {
+	return nil
+}
+
+func (fakeRestPage) ClearCookies() error {
+	return nil
+}
+
+func (fakeRestPage) Close() error {
+	return nil
+}
+
+func doHttpRequest0(method string, path string, headers map[string]string, body any) (int, []byte) {
+	r1, _, r3 := doHttpRequest1(method, path, headers, body)
+	return r1, r3
+}
+
+func doHttpRequest1(method string, path string, headers map[string]string, body any) (int, map[string]string, []byte) {
+	var reader io.Reader
+	if body != nil {
+		buf, _ := json.Marshal(body)
+		reader = bytes.NewBuffer(buf)
+	}
+
+	request, err := http.NewRequest(method, fmt.Sprintf("http://127.0.0.1:%d%s", restPort, path), reader)
+	if err != nil {
+		panic(err)
+	}
+	if headers != nil {
+		for k, v := range headers {
+			request.Header.Set(k, v)
+		}
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		panic(err)
+	}
+	defer response.Body.Close()
+
+	respHeader := make(map[string]string)
+	for k, vv := range response.Header {
+		respHeader[k] = vv[0]
+	}
+
+	respBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	return response.StatusCode, respHeader, respBody
+}
+
+func doHttpRequest[T any](method string, path string, headers map[string]string, body any) (int, *model.Result[T]) {
+	statusCode, respBody := doHttpRequest0(method, path, headers, body)
+	if statusCode != http.StatusOK {
+		panic(fmt.Sprintf("http request failed, status code: %d", statusCode))
+	}
+
+	var r model.Result[T]
+	if err := json.Unmarshal(respBody, &r); err != nil {
+		panic(err)
+	}
+	return int(r.Code), &r
+}
+
+func httpRequest[T any](method string, path string, body any) (int, *model.Result[T]) {
+	return doHttpRequest[T](method, path, nil, body)
+}
+
+func httpRequestCheckOk[T any](method string, path string, body any) T {
+	code, result := httpRequest[T](method, path, body)
+	checkOk(code)
+	return result.Data
+}
+
+func checkOk(code int) {
+	checkCode(code, model.CodeOk)
+}
+
+func checkCode(code int, exceptCode model.RespCode) {
+	if code != int(exceptCode) {
+		panic(fmt.Sprintf("code got = %d, want %d", code, exceptCode))
+	}
+}

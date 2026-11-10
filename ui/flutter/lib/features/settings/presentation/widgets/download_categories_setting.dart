@@ -1,0 +1,297 @@
+import 'package:flutter/material.dart' show Divider, Icons;
+import 'package:flutter/widgets.dart';
+import 'package:shadcn_flutter/shadcn_flutter.dart' as shad;
+
+import '../../../../api/model/downloader_config.dart';
+import '../../../../core/utils/breakpoints.dart';
+import '../../../../shared/theme/app_design_tokens.dart';
+import '../../../../shared/theme/app_palette.dart';
+import '../../../../shared/widgets/app_path_picker_field.dart';
+import '../../../../shared/widgets/app_path_placeholder_button.dart';
+import '../../../../shared/widgets/app_primary_button.dart';
+import '../../../../shared/widgets/app_text_field.dart';
+import '../../../../l10n/l10n.dart';
+import 'extension_tag_editor.dart';
+
+class DownloadCategoryDraft {
+  const DownloadCategoryDraft({required this.name, required this.path, required this.extensions});
+
+  final String name;
+  final String path;
+  final List<String> extensions;
+}
+
+class DownloadCategoriesControl extends StatelessWidget {
+  const DownloadCategoriesControl({
+    super.key,
+    required this.categories,
+    required this.displayName,
+    required this.onAdd,
+    required this.onEdit,
+    required this.onDelete,
+  });
+
+  final List<DownloadCategory> categories;
+  final String Function(DownloadCategory category) displayName;
+  final VoidCallback onAdd;
+  final ValueChanged<DownloadCategory> onEdit;
+  final ValueChanged<DownloadCategory> onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    final desktop = MediaQuery.sizeOf(context).width >= Breakpoints.mobile;
+    final visibleCategories = categories.where((category) => !category.isDeleted).toList(growable: false);
+    final palette = AppPalette.of(context);
+
+    return SizedBox(
+      key: const ValueKey('download-categories-editor'),
+      width: desktop ? AppDesignTokens.settingsFormControlWidth : double.infinity,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var index = 0; index < visibleCategories.length; index++) ...[
+            if (index > 0)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Divider(color: palette.border),
+              ),
+            _CategoryRow(
+              category: visibleCategories[index],
+              name: displayName(visibleCategories[index]),
+              onEdit: () => onEdit(visibleCategories[index]),
+              onDelete: () => onDelete(visibleCategories[index]),
+            ),
+          ],
+          if (visibleCategories.isNotEmpty) const SizedBox(height: 10),
+          Align(
+            alignment: desktop ? Alignment.centerRight : Alignment.centerLeft,
+            child: shad.SecondaryButton(
+              key: const ValueKey('add-download-category'),
+              onPressed: onAdd,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.add, size: 17),
+                  const SizedBox(width: AppDesignTokens.space8),
+                  Text(context.l10n.add),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CategoryRow extends StatelessWidget {
+  const _CategoryRow({required this.category, required this.name, required this.onEdit, required this.onDelete});
+
+  final DownloadCategory category;
+  final String name;
+  final VoidCallback onEdit;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = AppPalette.of(context);
+    final extensions = category.effectiveExtensions();
+    return Row(
+      key: ValueKey('download-category-${category.nameKey ?? category.name}-${category.path}'),
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                name,
+                style: TextStyle(color: palette.textPrimary, fontSize: 13, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                category.path,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: palette.textSecondary, fontSize: 12),
+              ),
+              if (extensions.isNotEmpty) ...[
+                const SizedBox(height: 3),
+                Text(
+                  extensions.join(', '),
+                  key: const ValueKey('download-category-extensions'),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: palette.textSecondary, fontSize: 11),
+                ),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(width: 8),
+        shad.GhostButton(
+          key: ValueKey('edit-download-category-${category.nameKey ?? category.name}'),
+          density: shad.ButtonDensity.icon,
+          onPressed: onEdit,
+          child: const Icon(Icons.edit_outlined, size: 17),
+        ),
+        shad.GhostButton(
+          key: ValueKey('delete-download-category-${category.nameKey ?? category.name}'),
+          density: shad.ButtonDensity.icon,
+          onPressed: onDelete,
+          child: const Icon(Icons.delete_outline, size: 17),
+        ),
+      ],
+    );
+  }
+}
+
+Future<DownloadCategoryDraft?> showDownloadCategoryDialog(
+  BuildContext context, {
+  DownloadCategory? category,
+  required String initialName,
+  required String initialPath,
+  required List<DownloadCategory> categories,
+  required String Function(DownloadCategory) displayName,
+}) async {
+  final nameController = TextEditingController(text: initialName);
+  final pathController = TextEditingController(text: category?.path ?? initialPath);
+  final editorKey = GlobalKey<ExtensionTagEditorState>();
+  final nameKey = category?.nameKey;
+  final restoreDefaults = nameKey == null
+      ? const <String>[]
+      : normalizeCategoryExtensions(kDefaultCategoryExtensions[nameKey] ?? const []);
+  // Extensions every other live category already owns, mapped to its
+  // display name; the edited category itself is exempt.
+  final takenExtensions = <String, String>{};
+  for (final other in categories) {
+    if (other.isDeleted || identical(other, category)) continue;
+    for (final extension in normalizeCategoryExtensions(other.effectiveExtensions())) {
+      takenExtensions.putIfAbsent(extension, () => displayName(other));
+    }
+  }
+
+  var extensionConflict = normalizeCategoryExtensions(
+    category?.effectiveExtensions() ?? const [],
+  ).any(takenExtensions.containsKey);
+  String? validationMessage;
+
+  final overlay = const shad.DialogOverlayHandler().show<DownloadCategoryDraft?>(
+    context: context,
+    alignment: Alignment.center,
+    barrierDismissable: false,
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (dialogContext, setDialogState) {
+        final palette = AppPalette.of(dialogContext);
+
+        void reportExtensionConflict(bool value) {
+          if (extensionConflict == value) return;
+          setDialogState(() => extensionConflict = value);
+        }
+
+        void submit() {
+          if (extensionConflict) return;
+          final name = nameController.text.trim();
+          final path = pathController.text.trim();
+          if (name.isEmpty || path.isEmpty) {
+            setDialogState(() => validationMessage = dialogContext.l10n.categoryFieldsRequired);
+            return;
+          }
+          shad.closeOverlay(
+            dialogContext,
+            DownloadCategoryDraft(name: name, path: path, extensions: editorKey.currentState?.flush() ?? const []),
+          );
+        }
+
+        return shad.AlertDialog(
+          title: Text(category == null ? dialogContext.l10n.addCategory : dialogContext.l10n.editCategory),
+          content: SizedBox(
+            key: const ValueKey('download-category-dialog'),
+            width: (MediaQuery.sizeOf(dialogContext).width - 64).clamp(260.0, 420.0),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(dialogContext.l10n.categoryName, style: TextStyle(color: palette.textSecondary, fontSize: 12)),
+                  const SizedBox(height: 6),
+                  AppTextField(key: const ValueKey('download-category-name'), controller: nameController),
+                  const SizedBox(height: 14),
+                  Text(dialogContext.l10n.categoryPath, style: TextStyle(color: palette.textSecondary, fontSize: 12)),
+                  const SizedBox(height: 6),
+                  AppPathPickerField.downloadDirectory(
+                    fieldKey: const ValueKey('download-category-path'),
+                    controller: pathController,
+                    desktopWidth: AppDesignTokens.settingsFormControlWidth,
+                    allowAndroidEditing: true,
+                  ),
+                  const SizedBox(height: AppDesignTokens.space4),
+                  Align(
+                    alignment: AlignmentDirectional.centerStart,
+                    child: AppPathPlaceholderButton(
+                      key: const ValueKey('download-category-placeholders'),
+                      controller: pathController,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  ExtensionTagEditor(
+                    key: editorKey,
+                    inputKey: const ValueKey('download-category-extensions-input'),
+                    initialTags: category?.effectiveExtensions() ?? const [],
+                    labelText: dialogContext.l10n.categoryExtensions,
+                    placeholderText: dialogContext.l10n.categoryExtensionsEmptyHint,
+                    usagePlaceholderText: dialogContext.l10n.categoryExtensionsUsageHint,
+                    restoreDefaults: restoreDefaults,
+                    takenByCategory: takenExtensions,
+                    onConflictChanged: reportExtensionConflict,
+                  ),
+                  if (validationMessage != null) ...[
+                    const SizedBox(height: 8),
+                    Text(validationMessage!, style: TextStyle(color: palette.error, fontSize: 12)),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            shad.SecondaryButton(
+              onPressed: () => shad.closeOverlay(dialogContext),
+              child: Text(dialogContext.l10n.cancel),
+            ),
+            AppPrimaryButton(onPressed: extensionConflict ? null : submit, child: Text(dialogContext.l10n.save)),
+          ],
+        );
+      },
+    ),
+  );
+
+  try {
+    return await overlay.future;
+  } finally {
+    await WidgetsBinding.instance.endOfFrame;
+    nameController.dispose();
+    pathController.dispose();
+  }
+}
+
+Future<bool> showDeleteDownloadCategoryDialog(BuildContext context, String name) async {
+  final overlay = const shad.DialogOverlayHandler().show<bool>(
+    context: context,
+    alignment: Alignment.center,
+    barrierDismissable: false,
+    builder: (dialogContext) => shad.AlertDialog(
+      title: Text(dialogContext.l10n.deleteCategoryTitle),
+      content: Text(dialogContext.l10n.confirmDeleteNamed(name)),
+      actions: [
+        shad.SecondaryButton(
+          onPressed: () => shad.closeOverlay(dialogContext, false),
+          child: Text(dialogContext.l10n.cancel),
+        ),
+        shad.DestructiveButton(
+          onPressed: () => shad.closeOverlay(dialogContext, true),
+          child: Text(dialogContext.l10n.delete),
+        ),
+      ],
+    ),
+  );
+  return await overlay.future ?? false;
+}

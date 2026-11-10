@@ -1,0 +1,156 @@
+import Flutter
+import Libgopeed
+import UIKit
+
+@main
+@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+  override func application(
+    _ application: UIApplication,
+    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+  ) -> Bool {
+    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
+    GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    let messenger = engineBridge.applicationRegistrar.messenger()
+    let libgopeedTaskQueue = messenger.makeBackgroundTaskQueue?()
+
+    let libgopeedChannel = FlutterMethodChannel(
+      name: "gopeed.com/libgopeed",
+      binaryMessenger: messenger,
+      codec: FlutterStandardMethodCodec.sharedInstance(),
+      taskQueue: libgopeedTaskQueue
+    )
+    let taskEventForwarder = GopeedTaskEventForwarder(channel: libgopeedChannel)
+    libgopeedChannel.setMethodCallHandler { call, result in
+      switch call.method {
+      case "start":
+        let arguments = call.arguments as? [String: Any]
+        let config = arguments?["cfg"] as? String
+        let port = UnsafeMutablePointer<Int>.allocate(capacity: 1)
+        defer { port.deallocate() }
+        var error: NSError?
+        if LibgopeedStart(config, port, &error) {
+          result(port.pointee)
+        } else {
+          result(
+            FlutterError(
+              code: "ERROR",
+              message: error?.localizedDescription ?? "Failed to start Libgopeed",
+              details: nil
+            )
+          )
+        }
+      case "stop":
+        LibgopeedStop()
+        result(nil)
+      case "getApiServerState":
+        result(LibgopeedGetAPIServerState())
+      case "startApiServer":
+        result(LibgopeedStartAPIServer())
+      case "stopApiServer":
+        result(LibgopeedStopAPIServer())
+      case "restartApiServer":
+        result(LibgopeedRestartAPIServer())
+      case "invoke":
+        let arguments = call.arguments as? [String: Any]
+        let method = arguments?["method"] as? String ?? ""
+        let path = arguments?["path"] as? String ?? ""
+        let query = arguments?["query"] as? String ?? ""
+        let body = arguments?["body"] as? String ?? ""
+        let requestID = (arguments?["requestID"] as? NSNumber)?.int64Value ?? 0
+        GopeedInvokeAsyncWithResult(method, path, query, body, requestID, result)
+      case "subscribeTaskEvents":
+        let arguments = call.arguments as? [String: Any]
+        let flutterMask =
+            (arguments?["mask"] as? NSNumber)?.int64Value ?? 0
+
+        let liveActivityMask =
+            LibgopeedLiveActivityTaskEventMask()
+
+        let combinedMask =
+            flutterMask | liveActivityMask
+
+        GopeedSubscribeTaskEventsWithForwarder(
+            combinedMask,
+            taskEventForwarder
+        )
+        result(nil)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
+    let locationChannel = FlutterMethodChannel(
+      name: "gopeed/location_keep_alive",
+      binaryMessenger: messenger
+    )
+    locationChannel.setMethodCallHandler { call, result in
+      switch call.method {
+      case "requestPermission":
+        LocationKeepAliveManager.shared.requestPermission { authorized in
+          result(authorized)
+        }
+      case "start":
+        LocationKeepAliveManager.shared.start()
+        result(nil)
+      case "stop":
+        LocationKeepAliveManager.shared.stop()
+        result(nil)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+    let continuedProcessingChannel =
+    FlutterMethodChannel(
+        name: "gopeed/continued_processing",
+        binaryMessenger: messenger
+    )
+
+    continuedProcessingChannel
+        .setMethodCallHandler { call, result in
+
+            switch call.method {
+
+            case "isSupported":
+
+                if #available(iOS 26.0, *) {
+                    result(true)
+                } else {
+                    result(false)
+                }
+
+            case "setEnabled":
+
+                let arguments =
+                    call.arguments
+                        as? [String: Any]
+
+                let enabled =
+                    arguments?["enabled"]
+                        as? Bool
+                    ?? false
+
+                if #available(iOS 26.0, *) {
+
+                    GopeedContinuedProcessingManager
+                        .shared
+                        .setEnabled(enabled) {
+                            success in
+                            result(success)
+                        }
+
+                } else {
+
+                    result(!enabled)
+                }
+
+            default:
+                result(
+                    FlutterMethodNotImplemented
+                )
+            }
+       }
+  }
+}

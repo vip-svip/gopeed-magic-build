@@ -1,0 +1,30 @@
+#!/system/bin/sh
+# gopeed-hls - 用一个命令下载 m3u8 / mpd（补齐上游 Gopeed 缺失的 HLS 支持）
+# 用法:
+#   gopeed-hls <url> [更多url...] [-d 目录] [-q best|720|worst] [-n 名称] [-j 并发]
+#   gopeed-hls -list <url>          列出可用清晰度
+#   gopeed-hls -H 'Referer: https://x' <url>   追加请求头
+MODDIR="${GOPEED_MODDIR:-/data/adb/modules/gopeed_ksu}"
+[ -f "$MODDIR/bin/hlsdl" ] || MODDIR=$(cd "${0%/*}/.." 2>/dev/null && pwd)
+
+BIN="$MODDIR/bin/hlsdl"
+if [ ! -x "$BIN" ]; then
+  echo "错误：找不到 hlsdl（$BIN）" >&2
+  exit 1
+fi
+
+# 默认输出到用户下载目录
+if [ -d /storage/emulated/0/Download ]; then
+  DEF_DIR=/storage/emulated/0/Download
+else
+  DEF_DIR=/storage/emulated/0
+fi
+
+# Go 需要可解析 DNS
+if [ ! -s /system/etc/resolv.conf ] && [ -s "$MODDIR/system/etc/resolv.conf" ]; then
+  export SSL_CERT_DIR="${SSL_CERT_DIR:-/system/etc/security/cacerts}"
+fi
+export TMPDIR="${TMPDIR:-/data/adb/gopeed/tmp}"
+mkdir -p "$TMPDIR" 2>/dev/null
+
+exec "$BIN" -dir "$DEF_DIR" "$@"

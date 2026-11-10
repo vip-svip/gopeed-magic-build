@@ -1,0 +1,115 @@
+import 'dart:convert';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:gopeed/api/api.dart' as api;
+import 'package:gopeed/api/model/create_task.dart';
+import 'package:gopeed/api/model/create_task_batch.dart';
+import 'package:gopeed/api/model/options.dart';
+import 'package:gopeed/api/model/patch_task.dart';
+import 'package:gopeed/api/model/request.dart';
+import 'package:gopeed/api/model/resolve_task.dart';
+import 'package:gopeed/core/network/gopeed/gopeed_transport.dart';
+
+void main() {
+  test('resolve omits download options and creation submits them separately', () async {
+    final transport = _RecordingTransport();
+    api.setTransportForTesting(transport);
+    final result = await api.resolve(
+      ResolveTask(req: Request(url: 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567')),
+    );
+
+    expect(result.id, 'resolved-id');
+    final requestBody = transport.data as Map<String, dynamic>;
+    expect(requestBody.keys, equals(<String>['req']));
+    expect(
+      (requestBody['req'] as Map<String, dynamic>)['url'],
+      'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567',
+    );
+    expect(requestBody, isNot(contains('opts')));
+
+    final id = await api.createTask(
+      CreateTask(
+        rid: result.id,
+        opts: Options(path: '/chosen-after-resolve', selectFiles: [1]),
+      ),
+    );
+    expect(id, 'created-id');
+    final createBody = transport.data as Map<String, dynamic>;
+    expect(createBody['rid'], 'resolved-id');
+    expect((createBody['opts'] as Map<String, dynamic>)['path'], '/chosen-after-resolve');
+    expect((createBody['opts'] as Map<String, dynamic>)['selectFiles'], [1]);
+  });
+
+  test('batch sends rid and options and decodes the unified response in both modes', () async {
+    for (final grouped in [false, true]) {
+      final transport = _RecordingTransport();
+      api.setTransportForTesting(transport);
+      final result = await api.createTaskBatch(
+        CreateTaskBatch(
+          group: grouped,
+          groupName: grouped ? 'folder' : '',
+          reqs: [
+            CreateTaskBatchItem(
+              rid: 'resolved-id',
+              opts: Options(selectFiles: [1]),
+            ),
+          ],
+        ),
+      );
+      expect(result.taskIds, ['created-id']);
+      expect(result.parentId, grouped ? 'parent' : null);
+      final body = transport.data as Map<String, dynamic>;
+      final member = (body['reqs'] as List).single as Map<String, dynamic>;
+      expect(member['rid'], 'resolved-id');
+      expect((member['opts'] as Map)['selectFiles'], [1]);
+      expect(body, isNot(contains('groupId')));
+    }
+  });
+
+  test('patch preserves options in its independent request model', () async {
+    final transport = _RecordingTransport();
+    api.setTransportForTesting(transport);
+    await api.patchTask('task-id', PatchTask(opts: Options(selectFiles: [1])));
+    final requestBody = transport.data as Map<String, dynamic>;
+    expect((requestBody['opts'] as Map<String, dynamic>)['selectFiles'], [1]);
+  });
+}
+
+class _RecordingTransport implements GopeedTransport {
+  dynamic data;
+
+  @override
+  Future<dynamic> request(
+    String path, {
+    String method = 'GET',
+    dynamic data,
+    Map<String, dynamic>? queryParameters,
+  }) async {
+    this.data = jsonDecode(jsonEncode(data));
+    if (path == 'api/v1/tasks/batch') {
+      return {
+        'code': 0,
+        'data': {
+          'taskIds': ['created-id'],
+          if (this.data['group'] == true) 'parentId': 'parent',
+        },
+      };
+    }
+    if (path == 'api/v1/tasks') {
+      return {'code': 0, 'data': 'created-id'};
+    }
+    if (method == 'PATCH') {
+      return {'code': 0, 'data': null};
+    }
+    return {
+      'code': 0,
+      'data': {
+        'id': 'resolved-id',
+        'res': {'name': 'sample', 'size': 0, 'range': false, 'files': <Object>[], 'hash': ''},
+      },
+    };
+  }
+
+  @override
+  String join(String path) => path;
+}
