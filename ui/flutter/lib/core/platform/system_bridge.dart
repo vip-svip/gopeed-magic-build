@@ -239,6 +239,19 @@ class SystemBridge {
     }
   }
 
+  /// 弹窗呈现位置同步给原生：系统悬浮窗（静默下载）按它决定居中还是底部，
+  /// 只存在 Dart 配置里的话原生 overlay 读不到，两边样式就会不一致。
+  Future<void> setDialogPresentation(String style) async {
+    if (!isSupported) return;
+    try {
+      await _channel.invokeMethod<bool>('setDialogPresentation', {'style': style});
+    } on PlatformException {
+      // ignore
+    } on MissingPluginException {
+      // ignore
+    }
+  }
+
   /// 退出时最小化：原生记录后，返回键/关闭行为改为退后台而不结束进程。
   Future<void> setMinimizeOnExit(bool enabled) async {
     if (!isSupported) return;

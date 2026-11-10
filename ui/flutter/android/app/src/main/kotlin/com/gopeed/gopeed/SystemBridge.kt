@@ -114,6 +114,13 @@ class SystemBridge(private val activity: Activity) {
                         )
                     )
                 }
+                "setDialogPresentation" -> {
+                    val style = (args?.get("style") as? String)?.ifBlank { "center" } ?: "center"
+                    RootHelper.prefs(activity).edit()
+                        .putString("dialog_presentation", style)
+                        .apply()
+                    result.success(true)
+                }
                 "setModulePort" -> {
                     val port = (args?.get("port") as? Number)?.toInt() ?: 0
                     if (port > 0) {
@@ -152,12 +159,21 @@ class SystemBridge(private val activity: Activity) {
      * iOS 的“从后台卡片里消失”在 Android 对应 excludeFromRecents，需要作用于 AppTask。
      */
     private fun hideFromRecents(hide: Boolean): Boolean {
+        // 必须同时落盘：readSystemPrefs 读的是 hide_from_recents，
+        // 以前这里只调 AppTask.setExcludeFromRecents 不写偏好，
+        // 于是设置页每次重进都读回 false → 显示「关闭」（用户反馈的真实根因）。
+        runCatching {
+            RootHelper.prefs(activity).edit()
+                .putBoolean("hide_from_recents", hide)
+                .apply()
+        }
         return try {
             val am = activity.getSystemService(Activity.ACTIVITY_SERVICE) as ActivityManager
             val tasks = am.appTasks
             if (tasks.isNullOrEmpty()) {
-                // 任务尚未建立（首次启动极早期），退回清单控制，返回 false 让上层记录
-                return false
+                // 任务尚未建立（首次启动极早期）：偏好已落盘，
+                // 清单里也写了 excludeFromRecents，这里视为成功。
+                return true
             }
             for (task in tasks) {
                 task.setExcludeFromRecents(hide)

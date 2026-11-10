@@ -102,7 +102,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   // ----- 模块（KernelSU / Magisk）联动状态 -----
   // 之前设置页完全不知道模块存在，用户只能自己开终端跑 gopeedctl，
   // 所以表现为「模块未联动 App」。这里直接读取并控制模块。
-  static const _ctlPath = '/data/adb/modules/gopeed_ksu/bin/gopeedctl';
+  // 模块目录名随 module.prop 的 id 变化，安装位置也随 Magisk / KernelSU /
+  // APatch 不同，所以控制脚本路径不能写死；下面用通配探测一次并缓存。
+  String? _ctlPath;
   Map<String, String>? _moduleInfo;
   bool _moduleLoading = false;
   bool _moduleBusy = false;
@@ -177,13 +179,17 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   /// 读取原生已保存的三项开关，避免界面默认值与真实状态不一致。
   Future<void> _loadSystemPrefs() async {
     if (!_moduleSupported) return;
+    // 注意：不受 _moduleSupported/模块检测影响，开关状态与模块无关。
     final bridge = ref.read(systemBridgeProvider);
     final prefs = await bridge.readSystemPrefs();
-    if (!mounted || prefs.isEmpty) return;
+    if (!mounted) return;
+    // 原生偏好可能缺键（这些开关以前根本没写盘），
+    // 此时必须保留配置里已有的值，不能用 false 覆盖 ——
+    // 这就是「开关明明生效了，退出再进来却显示关闭」的根因。
     setState(() {
-      _autoStart = prefs['autoStart'] ?? false;
-      _minimizeOnExit = prefs['minimizeOnExit'] ?? false;
-      _hideFromRecents = prefs['hideFromRecents'] ?? false;
+      _autoStart = prefs['autoStart'] ?? _autoStart;
+      _minimizeOnExit = prefs['minimizeOnExit'] ?? _minimizeOnExit;
+      _hideFromRecents = prefs['hideFromRecents'] ?? _hideFromRecents;
     });
   }
 
@@ -272,7 +278,16 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         });
         return;
       }
-      final result = await bridge.rootExec('sh $_ctlPath info 2>&1');
+      final ctl = await _resolveCtlPath(bridge);
+      if (ctl == null) {
+        if (!mounted) return;
+        setState(() {
+          _moduleInfo = null;
+          _moduleError = '已找到模块文件，但定位不到 bin/gopeedctl（请确认已授予 root 权限）';
+        });
+        return;
+      }
+      final result = await bridge.rootExec('sh $ctl info 2>&1');
       final out = (result.stdout as String).trim();
       final text = out.isEmpty ? (result.stderr as String) : out;
       final map = <String, String>{};
@@ -306,13 +321,49 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     }
   }
 
+  /// 探测模块控制脚本的真实路径。
+  ///
+  /// 模块目录名来自 module.prop 的 id，安装位置又随 Magisk / KernelSU /
+  /// APatch 不同，写死路径会让 `sh <path>` 直接失败且没有任何输出，
+  /// 界面就只剩一句「未就绪」。这里按候选目录逐个找 bin/gopeedctl，
+  /// 并兜底 PATH 里的同名命令，找到就缓存。
+  Future<String?> _resolveCtlPath(dynamic bridge) async {
+    final cached = _ctlPath;
+    if (cached != null && cached.isNotEmpty) return cached;
+    try {
+      final r = await bridge.rootExec(
+        'for d in /data/adb/modules/*gopeed* /data/adb/modules_update/*gopeed* '
+        '/data/adb/ksu/modules/*gopeed* /data/adb/ap/modules/*gopeed*; do '
+        '[ -f "\$d/bin/gopeedctl" ] && echo "\$d/bin/gopeedctl" && exit 0; done; '
+        'command -v gopeedctl 2>/dev/null',
+      );
+      final lines = (r.stdout as String)
+          .split('\n')
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty && !e.contains('not found'))
+          .toList();
+      final found = lines.isEmpty ? null : lines.first;
+      _ctlPath = found;
+      return found;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// 模块文件是否存在。不依赖 root 命令输出，避免把「没装」误判成「检测失败」。
   Future<bool> _moduleFilesExist(dynamic bridge) async {
     try {
+      // 覆盖 Magisk / KernelSU / APatch 的真实落盘位置，并用通配匹配目录名
+      // （模块目录名随 module.prop 的 id 变化），避免「装着模块却报未就绪」。
       final r = await bridge.rootExec(
-        'ls $_ctlPath 2>/dev/null || ls /data/adb/modules/gopeed_ksu 2>/dev/null',
+        'ls -d /data/adb/modules/*gopeed* /data/adb/modules_update/*gopeed* '
+        '/data/adb/ksu/modules/*gopeed* /data/adb/ap/modules/*gopeed* '
+        '2>/dev/null; command -v gopeedctl 2>/dev/null',
       );
-      return (r.stdout as String).trim().isNotEmpty;
+      if ((r.stdout as String).trim().isNotEmpty) return true;
+      // 目录探测不到，再看控制脚本本身能不能定位（自定义目录安装的情况）。
+      final ctl = await _resolveCtlPath(bridge);
+      return ctl != null && ctl.isNotEmpty;
     } catch (_) {
       return false;
     }
@@ -323,7 +374,16 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     setState(() => _moduleBusy = true);
     try {
       final bridge = ref.read(systemBridgeProvider);
-      final result = await bridge.rootExec('sh $_ctlPath $arg 2>&1');
+      final ctl = await _resolveCtlPath(bridge);
+      if (ctl == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('未找到模块控制脚本，请确认模块已安装并已授予 root')),
+          );
+        }
+        return;
+      }
+      final result = await bridge.rootExec('sh $ctl $arg 2>&1');
       final out = result.stdout.trim().isEmpty ? result.stderr.trim() : result.stdout.trim();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -723,7 +783,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                         AppChoiceOption(value: 'center', label: '居中浮窗', icon: Icons.crop_square_outlined),
                         AppChoiceOption(value: 'bottom', label: '底部弹出', icon: Icons.vertical_align_bottom_outlined),
                       ],
-                      onChanged: (value) => _mutateConfig((next) => next.extra.dialogPresentation = value),
+                      onChanged: (value) {
+                        _mutateConfig((next) => next.extra.dialogPresentation = value);
+                        // 系统悬浮窗（静默下载）读的是原生偏好，
+                        // 只改 Dart 配置会让两边样式不一致。
+                        ref.read(systemBridgeProvider).setDialogPresentation(value);
+                      },
                     ),
                   ),
                   SettingsItem(

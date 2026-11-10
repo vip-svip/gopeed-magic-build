@@ -1,6 +1,7 @@
 package com.gopeed.gopeed
 
 import android.app.Activity
+import android.app.DownloadManager
 import android.content.Intent
 import android.os.Bundle
 import java.net.HttpURLConnection
@@ -45,35 +46,43 @@ class SilentGateActivity : Activity() {
         }
 
         val name = DownloadOverlayService.guessName(url)
-
-        // 内核没起来（典型情况：只装了 APK，没装 root 模块）→ 必须退回 App 建任务
-        if (!ensureKernelUp()) {
-            forward(url)
-            return
-        }
+        val kernelUp = ensureKernelUp()
 
         if (mode == MODE_ASK) {
+            // 询问：只弹系统级悬浮窗（居中/底部折叠卡片），不打开 App。
             if (DownloadOverlayService.canDraw(this)) {
                 DownloadOverlayService.show(this, url, name)
                 finish()
                 overridePendingTransition(0, 0)
+            } else if (kernelUp) {
+                DownloadOverlayService.show(this, url, name)
+                finish()
+                overridePendingTransition(0, 0)
             } else {
-                // 没悬浮窗权限就不能"静默"确认了，进 App 让用户看清
                 forward(url)
             }
             return
         }
 
-        // headless：直接投递，不做任何确认
-        val dispatched = postTask(url)
-        if (dispatched) {
+        // headless（无界面）：只下载，绝不打开任何界面。
+        // 以前 postTask 失败就 forward 拉主界面 —— 这正是「无界面还是会跳进 App」。
+        if (kernelUp && postTask(url)) {
             OverlayBridge.notify(this, "已开始下载", name)
             finish()
             overridePendingTransition(0, 0)
-        } else {
-            // 投递失败绝不吞掉用户操作：交给 App 正常下载
-            forward(url)
+            return
         }
+        // 内核不可用：交给系统下载器，仍然零界面，只发系统通知。
+        if (enqueueSystemDownload(url, name)) {
+            OverlayBridge.notify(this, "已加入系统下载", name)
+            finish()
+            overridePendingTransition(0, 0)
+            return
+        }
+        // 磁力 / ed2k 只能由内核处理：明确告知，不偷偷把用户拽进 App。
+        OverlayBridge.notify(this, "无法无界面下载", "请检查模块是否就绪\n$name")
+        finish()
+        overridePendingTransition(0, 0)
     }
 
     /** 确保本机内核在监听；必要时用 root 拉起模块一次。 */
@@ -134,6 +143,40 @@ class SilentGateActivity : Activity() {
             ) return first
         }
         return ""
+    }
+
+    /**
+     * 系统下载器兜底：http/https/ftp 直接交给 DownloadManager。
+     * 零界面、零 App 进程，下载完成由系统通知提醒。
+     */
+    private fun enqueueSystemDownload(url: String, name: String): Boolean {
+        val lower = url.lowercase()
+        val okScheme = lower.startsWith("http://") || lower.startsWith("https://") ||
+            lower.startsWith("ftp://") || lower.startsWith("ftps://")
+        if (!okScheme) return false
+        return try {
+            val dm = getSystemService(DownloadManager::class.java) ?: return false
+            val safe = name.ifBlank { "download" }
+            val req = DownloadManager.Request(android.net.Uri.parse(url)).apply {
+                setTitle(safe)
+                setDescription("Gopeed 静默下载")
+                setNotificationVisibility(
+                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+                )
+                setAllowedOverMetered(true)
+                setAllowedOverRoaming(true)
+                try {
+                    setDestinationInExternalPublicDir(
+                        android.os.Environment.DIRECTORY_DOWNLOADS, safe
+                    )
+                } catch (_: Throwable) {
+                }
+            }
+            dm.enqueue(req)
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     private fun postTask(url: String): Boolean {

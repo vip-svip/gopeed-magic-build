@@ -61,7 +61,11 @@ class SkiaLiquidGlass extends StatelessWidget {
     final br = BorderRadius.all(Radius.circular(radius));
     final tint = tintColor ?? (isDark ? const Color(0xFF1E242C) : const Color(0xFFF1F4F9));
 
-    // 玻璃本体：裁剪 → 模糊 → 染色。
+    // 玻璃本体：裁剪 → 模糊 → 染色 → 高光 → 内容。
+    //
+    // 关键：高光/边缘必须画在**内容之下**。
+    // 之前用 foregroundPainter 把白色高光盖在子树上，浅色主题下
+    // 0.52 的白膜直接冲淡了文字（用户反馈「前面的文字显示变浅了」）。
     Widget glass = ClipRRect(
       borderRadius: br,
       child: BackdropFilter(
@@ -70,34 +74,43 @@ class SkiaLiquidGlass extends StatelessWidget {
           sigmaY: blurSigma,
           tileMode: TileMode.clamp,
         ),
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            borderRadius: br,
-            gradient: LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              colors: [
-                tint.withValues(alpha: isDark ? 0.74 : 0.86),
-                tint.withValues(alpha: isDark ? 0.54 : 0.64),
-              ],
+        child: Stack(
+          children: [
+            // 染色层：竖向渐变模拟玻璃厚度。
+            Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  borderRadius: br,
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      tint.withValues(alpha: isDark ? 0.74 : 0.86),
+                      tint.withValues(alpha: isDark ? 0.54 : 0.64),
+                    ],
+                  ),
+                ),
+              ),
             ),
-          ),
-          child: Padding(padding: padding, child: child),
+            // 高光 / rim light / 描边：压在内容之下，文字始终清晰。
+            Positioned.fill(
+              child: IgnorePointer(
+                child: CustomPaint(
+                  painter: _GlassEdgePainter(
+                    borderRadius: br,
+                    isDark: isDark,
+                    rimStrength: rimStrength,
+                    showSpecular: showSpecular,
+                    outlineColor: outlineColor,
+                    outlineWidth: outlineWidth,
+                  ),
+                ),
+              ),
+            ),
+            Padding(padding: padding, child: child),
+          ],
         ),
       ),
-    );
-
-    // 高光与边缘：画在玻璃之上。
-    glass = CustomPaint(
-      foregroundPainter: _GlassEdgePainter(
-        borderRadius: br,
-        isDark: isDark,
-        rimStrength: rimStrength,
-        showSpecular: showSpecular,
-        outlineColor: outlineColor,
-        outlineWidth: outlineWidth,
-      ),
-      child: glass,
     );
 
     if (shadows.isNotEmpty) {
