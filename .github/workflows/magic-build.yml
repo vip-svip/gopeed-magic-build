@@ -9,7 +9,7 @@ env:
   GO_VERSION: "1.25.4"
   FLUTTER_VERSION: "3.47.9"
   TARGET_REPO: vip-svip/gopeed
-  TAG: magic-v2.0.0-beta.13
+  TAG: magic-v2.0.0-beta.14
 
 permissions:
   contents: write
