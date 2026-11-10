@@ -30,6 +30,7 @@ import '../../../../shared/widgets/app_text_field.dart';
 import '../../../../shared/widgets/app_tooltip.dart';
 import '../../../../shared/widgets/app_toast.dart';
 import '../../../../shared/widgets/responsive_menu_layout.dart';
+import '../../../../shared/widgets/skia_liquid_glass.dart';
 import '../../../../l10n/l10n.dart';
 import '../../../../util/log_util.dart';
 import '../../../../util/package_info.dart';
@@ -2266,12 +2267,13 @@ class _SettingsGroup extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final palette = AppPalette.of(context);
-    return Container(
-      decoration: BoxDecoration(
-        color: palette.cardBg,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: palette.border),
-      ),
+    // iOS 液态玻璃分组卡片：模糊背板 + 竖向染色 + 高光 + 发丝描边。
+    return SkiaLiquidGlass(
+      radius: 14,
+      blurSigma: 20,
+      padding: EdgeInsets.zero,
+      outlineColor: palette.border,
+      outlineWidth: 1,
       child: ListView.separated(
         shrinkWrap: true,
         physics: const NeverScrollableScrollPhysics(),

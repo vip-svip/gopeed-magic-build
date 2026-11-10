@@ -5,47 +5,97 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
 <title>Gopeed 服务</title>
 <style>
+  /* ===== iOS 液态玻璃 · Web 面板 =====
+     与 App 端 Skia 自绘同一套分层：
+     背景模糊 → 竖向染色 → 顶部镜面高光 → 斜向 rim light → 发丝描边 */
   :root {
-    --bg: #0b0c0f;
-    --card: rgba(255,255,255,0.055);
-    --stroke: rgba(255,255,255,0.10);
-    --text: #f2f3f5;
-    --muted: rgba(242,243,245,0.56);
+    --bg: #0a0b0e;
+    --bg-2: #12151a;
+    --glass: rgba(255,255,255,0.075);
+    --glass-2: rgba(255,255,255,0.045);
+    --stroke: rgba(255,255,255,0.16);
+    --stroke-strong: rgba(255,255,255,0.30);
+    --text: #f5f6f8;
+    --muted: rgba(245,246,248,0.56);
     --accent: #0a84ff;
     --ok: #30d158;
     --err: #ff453a;
     --warn: #ff9f0a;
+    --radius: 22px;
+    --blur: 24px;
   }
   @media (prefers-color-scheme: light) {
     :root {
-      --bg: #f4f5f7;
-      --card: #ffffff;
-      --stroke: rgba(0,0,0,0.08);
+      --bg: #eef1f6;
+      --bg-2: #e3e8f0;
+      --glass: rgba(255,255,255,0.62);
+      --glass-2: rgba(255,255,255,0.40);
+      --stroke: rgba(17,22,29,0.18);
+      --stroke-strong: rgba(17,22,29,0.34);
       --text: #14161a;
       --muted: rgba(20,22,26,0.55);
     }
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { min-height: 100%; }
   body {
     margin: 0;
     padding: 22px 16px calc(28px + env(safe-area-inset-bottom));
-    background: var(--bg);
     color: var(--text);
     font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    /* 背景要有层次，玻璃才有东西可折射 */
+    background:
+      radial-gradient(1100px 520px at 18% -8%, rgba(10,132,255,0.34), transparent 62%),
+      radial-gradient(880px 460px at 92% 6%, rgba(191,90,242,0.22), transparent 60%),
+      radial-gradient(760px 420px at 50% 108%, rgba(48,209,88,0.16), transparent 62%),
+      linear-gradient(168deg, var(--bg-2), var(--bg));
+    background-attachment: fixed;
   }
+
   header { display: flex; align-items: center; gap: 10px; margin: 4px 2px 20px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
-  .dot.on { background: var(--ok); box-shadow: 0 0 0 4px rgba(48,209,88,0.16); }
-  .dot.off { background: var(--err); box-shadow: 0 0 0 4px rgba(255,69,58,0.16); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 4px rgba(48,209,88,0.18), 0 0 12px rgba(48,209,88,0.55); }
+  .dot.off { background: var(--err); box-shadow: 0 0 0 4px rgba(255,69,58,0.18), 0 0 12px rgba(255,69,58,0.45); }
   h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; margin: 0; }
   .sub { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+
+  /* 玻璃卡片：模糊 + 竖向染色 + 顶部高光 + 斜向边缘反光 */
   .card {
-    background: var(--card);
+    position: relative;
+    background: linear-gradient(180deg, var(--glass), var(--glass-2));
     border: 1px solid var(--stroke);
-    border-radius: 18px;
+    border-radius: var(--radius);
     padding: 16px 17px;
     margin-bottom: 13px;
+    -webkit-backdrop-filter: blur(var(--blur)) saturate(180%);
+    backdrop-filter: blur(var(--blur)) saturate(180%);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.30),
+      inset 0 -1px 0 rgba(0,0,0,0.06),
+      0 10px 30px rgba(0,0,0,0.16);
+    overflow: hidden;
   }
+  /* 顶部镜面高光带：模拟玻璃曲面受光 */
+  .card::before {
+    content: "";
+    position: absolute; left: 0; right: 0; top: 0; height: 46%;
+    background: linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0));
+    pointer-events: none;
+  }
+  /* 斜向 rim light：左上亮、右下弱 */
+  .card::after {
+    content: "";
+    position: absolute; inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(140deg, rgba(255,255,255,0.95), rgba(255,255,255,0) 46%, rgba(255,255,255,0.28));
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+  .card > * { position: relative; z-index: 1; }
+
   .k { color: var(--muted); font-size: 12px; letter-spacing: 0.02em; margin-bottom: 6px; }
   .addr {
     font: 600 21px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -57,20 +107,57 @@
   .port {
     font: 700 30px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
     letter-spacing: -0.02em;
+    text-shadow: 0 1px 12px rgba(10,132,255,0.35);
   }
   .row { display: flex; gap: 9px; margin-top: 13px; flex-wrap: wrap; }
+
+  /* 玻璃按钮：按压缩放 + 回弹，和 App 端底栏手感一致 */
   button {
-    appearance: none; border: 0; border-radius: 12px;
-    padding: 11px 17px; font-size: 14px; font-weight: 600;
-    color: #fff; background: var(--accent);
-    cursor: pointer; transition: opacity .16s, transform .16s;
-    flex: 1 1 auto; min-width: 96px;
+    appearance: none;
+    border: 1px solid var(--stroke-strong);
+    border-radius: 14px;
+    padding: 11px 17px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+    background: linear-gradient(180deg, rgba(255,255,255,0.22), rgba(255,255,255,0.06));
+    -webkit-backdrop-filter: blur(14px) saturate(180%);
+    backdrop-filter: blur(14px) saturate(180%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.34), 0 4px 14px rgba(0,0,0,0.14);
+    cursor: pointer;
+    transition: transform .18s cubic-bezier(0.2, 0.9, 0.3, 1.25), opacity .16s, box-shadow .18s;
+    flex: 1 1 auto;
+    min-width: 96px;
   }
-  button:active { transform: scale(0.97); opacity: .82; }
-  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--stroke); }
-  button.danger { background: var(--err); }
-  button.warn { background: var(--warn); }
-  button:disabled { opacity: .45; cursor: default; }
+  button:active {
+    transform: scale(0.94);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.20), 0 2px 8px rgba(0,0,0,0.12);
+  }
+  button.ghost { background: rgba(255,255,255,0.06); color: var(--text); }
+  button.danger { background: linear-gradient(180deg, #ff6961, var(--err)); border-color: rgba(255,255,255,0.30); color: #fff; }
+  button.warn   { background: linear-gradient(180deg, #ffb340, var(--warn)); border-color: rgba(255,255,255,0.30); color: #241a00; }
+  button:disabled { opacity: .45; cursor: default; transform: none; }
+
+  input {
+    -webkit-appearance: none;
+    appearance: none;
+    background: rgba(255,255,255,0.10);
+    border: 1px solid var(--stroke);
+    border-radius: 14px;
+    padding: 11px 13px;
+    color: var(--text);
+    font-size: 15px;
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    transition: border-color .18s, box-shadow .18s;
+  }
+  input:focus {
+    outline: none;
+    border-color: rgba(10,132,255,0.72);
+    box-shadow: 0 0 0 4px rgba(10,132,255,0.18);
+  }
+  input::placeholder { color: var(--muted); }
+
   .status { min-height: 18px; font-size: 12.5px; color: var(--muted); margin-top: 11px; }
   .status.ok { color: var(--ok); }
   .status.err { color: var(--err); }
@@ -78,18 +165,35 @@
   .sk { color: var(--muted); }
   code {
     font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
-    background: rgba(127,127,127,0.14);
-    padding: 2px 6px; border-radius: 6px;
+    background: rgba(127,127,127,0.16);
+    padding: 2px 6px; border-radius: 7px;
   }
+
+  /* Toast：iOS 通知胶囊 */
   .toast {
     position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom));
-    transform: translate(-50%, 18px);
-    background: rgba(28,29,33,0.94); color: #fff;
-    padding: 10px 18px; border-radius: 999px; font-size: 13px;
-    opacity: 0; pointer-events: none; transition: all .22s;
+    transform: translate(-50%, 18px) scale(0.96);
+    background: rgba(28,29,33,0.82);
+    -webkit-backdrop-filter: blur(22px) saturate(180%);
+    backdrop-filter: blur(22px) saturate(180%);
+    border: 1px solid rgba(255,255,255,0.16);
+    color: #fff;
+    padding: 11px 19px; border-radius: 999px; font-size: 13px;
+    box-shadow: 0 12px 34px rgba(0,0,0,0.32), inset 0 1px 0 rgba(255,255,255,0.24);
+    opacity: 0; pointer-events: none;
+    transition: opacity .22s, transform .26s cubic-bezier(0.2,0.9,0.3,1.25);
     max-width: 86vw; text-align: center;
   }
-  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  .toast.show { opacity: 1; transform: translate(-50%, 0) scale(1); }
+
+  /* 尊重"减少动态效果"偏好 */
+  @media (prefers-reduced-motion: reduce) {
+    button, .toast { transition: none; }
+  }
+  /* 老浏览器不支持 backdrop-filter 时，提高不透明度保证可读 */
+  @supports not (backdrop-filter: blur(1px)) {
+    .card { background: var(--glass); }
+  }
 </style>
 </head>
 <body>

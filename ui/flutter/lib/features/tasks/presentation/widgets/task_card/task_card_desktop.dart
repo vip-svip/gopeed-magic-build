@@ -101,7 +101,19 @@ class _TaskCardDesktopState extends State<TaskCardDesktop> {
             child: Stack(
               fit: StackFit.expand,
               children: [
-                ColoredBox(color: baseColor),
+                // 液态玻璃基底（与移动端同一套染色）：
+                // 半透明竖向渐变 + 极光背景透射，取代原来的实色底。
+                DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: isDark
+                          ? const [Color(0x5CFFFFFF), Color(0x24FFFFFF)]
+                          : const [Color(0xE6FFFFFF), Color(0xB8FFFFFF)],
+                    ),
+                  ),
+                ),
                 if (_hovered)
                   IgnorePointer(
                     child: ColoredBox(key: const ValueKey('task-card-hover-surface'), color: hoverColor),

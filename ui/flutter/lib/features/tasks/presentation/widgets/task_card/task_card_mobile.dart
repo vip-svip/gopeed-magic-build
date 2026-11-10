@@ -78,7 +78,20 @@ class _TaskCardMobileState extends State<TaskCardMobile> {
             clipBehavior: Clip.hardEdge,
             child: Stack(
               children: [
-                Positioned.fill(child: ColoredBox(color: baseColor)),
+                // 液态玻璃基底：半透明竖向染色，让极光背景透上来形成材质感。
+                Positioned.fill(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: isDark
+                            ? const [Color(0x5CFFFFFF), Color(0x24FFFFFF)]
+                            : const [Color(0xE6FFFFFF), Color(0xB8FFFFFF)],
+                      ),
+                    ),
+                  ),
+                ),
                 if (_hovered)
                   Positioned.fill(
                     child: IgnorePointer(

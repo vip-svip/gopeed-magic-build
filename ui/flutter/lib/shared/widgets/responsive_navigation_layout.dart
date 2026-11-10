@@ -5,6 +5,7 @@ import '../../core/utils/breakpoints.dart';
 import '../theme/app_palette.dart';
 import 'secondary_navigation_pane.dart';
 import 'app_swipe_tabs.dart';
+import 'skia_liquid_glass.dart';
 
 class ResponsiveNavigationItem<T> {
   const ResponsiveNavigationItem({required this.value, required this.label, this.icon, this.count});
@@ -122,17 +123,14 @@ class _MobileNavigationTabs<T> extends StatelessWidget {
         // beta.6：整条胶囊铺满左右（左右留 16），三项等分，不滚动。
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
-          child: Container(
+          // iOS 液态玻璃分段器：模糊背板 + 竖向染色 + 镜面高光 + 黑色线包边。
+          child: SkiaLiquidGlass(
+            radius: 999,
+            blurSigma: 18,
+            rimStrength: 1.0,
             padding: const EdgeInsets.all(4),
-            decoration: BoxDecoration(
-              color: isDark ? palette.surfaceSoft : const Color(0xFFF7F8FA),
-              borderRadius: pill,
-              // 用户指定：这一栏要黑色线包边（iOS 液态玻璃的分段器就是深色描边）
-              border: Border.all(
-                color: isDark ? const Color(0xFFEDF1F5).withValues(alpha: 0.62) : const Color(0xFF11161D),
-                width: 1.6,
-              ),
-            ),
+            outlineColor: isDark ? const Color(0xFFEDF1F5).withValues(alpha: 0.62) : const Color(0xFF11161D),
+            outlineWidth: 1.6,
             child: Row(
               children: [
                 for (final item in items)

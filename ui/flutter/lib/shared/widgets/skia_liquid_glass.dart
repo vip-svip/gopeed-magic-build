@@ -27,6 +27,8 @@ class SkiaLiquidGlass extends StatelessWidget {
     this.padding = EdgeInsets.zero,
     this.rimStrength = 1.0,
     this.showSpecular = true,
+    this.outlineColor,
+    this.outlineWidth = 1.6,
   });
 
   final Widget child;
@@ -46,6 +48,12 @@ class SkiaLiquidGlass extends StatelessWidget {
 
   /// 是否绘制顶部镜面高光。
   final bool showSpecular;
+
+  /// 外圈实色描边（用户要的"黑色线包边"）；不传则只用 rim light 与发丝边。
+  final Color? outlineColor;
+
+  /// 外圈描边宽度。
+  final double outlineWidth;
 
   @override
   Widget build(BuildContext context) {
@@ -86,6 +94,8 @@ class SkiaLiquidGlass extends StatelessWidget {
         isDark: isDark,
         rimStrength: rimStrength,
         showSpecular: showSpecular,
+        outlineColor: outlineColor,
+        outlineWidth: outlineWidth,
       ),
       child: glass,
     );
@@ -106,12 +116,16 @@ class _GlassEdgePainter extends CustomPainter {
     required this.isDark,
     required this.rimStrength,
     required this.showSpecular,
+    required this.outlineColor,
+    required this.outlineWidth,
   });
 
   final BorderRadius borderRadius;
   final bool isDark;
   final double rimStrength;
   final bool showSpecular;
+  final Color? outlineColor;
+  final double outlineWidth;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -182,6 +196,18 @@ class _GlassEdgePainter extends CustomPainter {
         ..strokeWidth = 0.8
         ..color = (isDark ? Colors.white : const Color(0xFF8E9AA8)).withValues(alpha: isDark ? 0.10 : 0.16),
     );
+
+    // 实色外描边（"黑色线包边"）：画在最外层，压住 rim light，形成清晰边界。
+    final outline = outlineColor;
+    if (outline != null) {
+      canvas.drawRRect(
+        rrect.deflate(outlineWidth / 2),
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = outlineWidth
+          ..color = outline,
+      );
+    }
   }
 
   @override
@@ -189,5 +215,7 @@ class _GlassEdgePainter extends CustomPainter {
       old.isDark != isDark ||
       old.rimStrength != rimStrength ||
       old.showSpecular != showSpecular ||
+      old.outlineColor != outlineColor ||
+      old.outlineWidth != outlineWidth ||
       old.borderRadius != borderRadius;
 }

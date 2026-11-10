@@ -16,6 +16,7 @@ import '../../../../app/router/app_router.dart';
 import '../../../../core/window/app_window_chrome.dart';
 import '../../../../shared/theme/app_design_tokens.dart';
 import '../../../../shared/theme/app_palette.dart';
+import '../../../../shared/widgets/app_aurora_backdrop.dart';
 import '../../../../shared/widgets/app_toast.dart';
 import '../../../../shared/widgets/responsive_navigation_layout.dart';
 import '../../../../l10n/l10n.dart';
@@ -302,6 +303,8 @@ class _HomePageState extends ConsumerState<HomePage> {
         backgroundColor: palette.bg,
         child: Stack(
           children: [
+            // 液态玻璃的折射底：极光渐层，让上方玻璃有明暗可抓。
+            const Positioned.fill(child: AppAuroraBackdrop()),
             Positioned.fill(
               child: BottomNavInset(
                 child: ResponsiveNavigationLayout<_TaskFilter>(
